@@ -1,8 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
+from sqlalchemy.orm import Session
+from database import get_db
+from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider
 
 app = FastAPI(
     title="RAG Chat API",
@@ -87,9 +90,32 @@ async def list_endpoints():
                 "path": "/api/endpoints",
                 "method": "GET",
                 "description": "List all available endpoints"
+            },
+            {
+                "path": "/api/llm-models",
+                "method": "GET",
+                "description": "List all LLM models"
+            },
+            {
+                "path": "/api/users",
+                "method": "GET",
+                "description": "List all users"
             }
         ]
     }
+
+# Database endpoints
+@app.get("/api/llm-models")
+async def get_llm_models(db: Session = Depends(get_db)):
+    """Get all LLM models"""
+    models = db.query(LLMModel).all()
+    return models
+
+@app.get("/api/users")
+async def get_users(db: Session = Depends(get_db)):
+    """Get all users"""
+    users = db.query(User).all()
+    return users
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
