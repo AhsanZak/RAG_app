@@ -37,6 +37,30 @@ class LLMModel(Base):
         return f"<LLMModel(name='{self.model_name}', provider='{self.provider}')>"
 
 
+class EmbeddingModel(Base):
+    """Model for storing embedding model configurations"""
+    __tablename__ = "embedding_models"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    model_name = Column(String(200), nullable=False, unique=True, index=True)
+    display_name = Column(String(200), nullable=False)
+    description = Column(Text)
+    language = Column(String(50))  # 'english', 'arabic', 'multilingual', etc.
+    model_path = Column(String(500))  # HuggingFace model path or local path
+    dimension = Column(Integer)  # Embedding dimension
+    is_active = Column(Integer, default=1)  # 1 for active, 0 for inactive
+    is_downloaded = Column(Integer, default=0)  # 1 if downloaded, 0 if not
+    download_progress = Column(Integer, default=0)  # Download progress percentage
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationship with chat sessions
+    chat_sessions = relationship("ChatSession", back_populates="embedding_model")
+    
+    def __repr__(self):
+        return f"<EmbeddingModel(name='{self.model_name}', language='{self.language}')>"
+
+
 class User(Base):
     """Model for storing users"""
     __tablename__ = "users"
@@ -65,6 +89,7 @@ class ChatSession(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     session_name = Column(String(200))  # Optional session name
     llm_model_id = Column(Integer, ForeignKey("llm_models.id"), nullable=False)
+    embedding_model_id = Column(Integer, ForeignKey("embedding_models.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -73,6 +98,9 @@ class ChatSession(Base):
     
     # Relationship with LLM model
     llm_model = relationship("LLMModel", back_populates="chat_sessions")
+    
+    # Relationship with embedding model
+    embedding_model = relationship("EmbeddingModel", back_populates="chat_sessions")
     
     # Relationship with chat messages
     chat_messages = relationship("ChatMessage", back_populates="chat_session", cascade="all, delete-orphan")

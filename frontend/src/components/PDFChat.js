@@ -12,24 +12,21 @@ import {
   Alert,
   Divider,
   Select,
-  Tooltip,
   Modal,
   Input,
   message
 } from 'antd';
 import {
-  UploadOutlined,
   FilePdfOutlined,
   DeleteOutlined,
   SendOutlined,
   RobotOutlined,
   UserOutlined,
-  CloseOutlined,
   CheckCircleOutlined,
   LoadingOutlined
 } from '@ant-design/icons';
 import Markdown from 'react-markdown';
-import { llmModelsAPI, pdfChatAPI } from '../services/api';
+import { llmModelsAPI, pdfChatAPI, embeddingModelsAPI } from '../services/api';
 import '../styles/PDFChat.css';
 
 const { Header, Content, Footer } = Layout;
@@ -39,7 +36,6 @@ const { Dragger } = Upload;
 
 const PDFChat = ({ onBack }) => {
   const [files, setFiles] = useState([]);
-  const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({});
   const [chatMessages, setChatMessages] = useState([]);
   const [inputValue, setInputValue] = useState('');
@@ -47,15 +43,23 @@ const PDFChat = ({ onBack }) => {
   const [currentSession, setCurrentSession] = useState(null);
   const [availableModels, setAvailableModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState(null);
+  const [availableEmbeddingModels, setAvailableEmbeddingModels] = useState([]);
+  const [selectedEmbeddingModelName, setSelectedEmbeddingModelName] = useState('all-MiniLM-L6-v2'); // Default model
   const [processingFiles, setProcessingFiles] = useState(false);
   const [sessionReady, setSessionReady] = useState(false); // Track if session has processed PDFs
+  const [showEmbeddingModal, setShowEmbeddingModal] = useState(false);
+  const [downloadingModels, setDownloadingModels] = useState({});
+  const [modalEmbeddingModels, setModalEmbeddingModels] = useState([]);
+  const [loadingModalModels, setLoadingModalModels] = useState(false);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
   useEffect(() => {
     loadModels();
+    loadEmbeddingModels();
     loadSessions();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // These should only run once on mount
 
   useEffect(() => {
     scrollToBottom();
@@ -74,6 +78,44 @@ const PDFChat = ({ onBack }) => {
     }
   };
 
+  const loadEmbeddingModels = async () => {
+    try {
+      console.log('Loading embedding models...');
+      const models = await embeddingModelsAPI.getAll();
+      console.log('Received embedding models:', models);
+      
+      if (!models || !Array.isArray(models)) {
+        console.warn('Invalid models response:', models);
+        setAvailableEmbeddingModels([]);
+        setSelectedEmbeddingModelName('all-MiniLM-L6-v2');
+        return;
+      }
+      
+      const activeModels = models.filter(model => model.is_active === 1 || model.is_active === undefined);
+      console.log('Active embedding models:', activeModels);
+      setAvailableEmbeddingModels(activeModels);
+      
+      if (activeModels.length > 0) {
+        // Prefer multilingual or English models
+        const preferred = activeModels.find(m => 
+          m.language === 'multilingual' || m.language === 'english'
+        ) || activeModels[0];
+        setSelectedEmbeddingModelName(preferred.model_name);
+        console.log('Selected default embedding model:', preferred.model_name);
+      } else {
+        // No models available, use default
+        console.warn('No active embedding models found, using default');
+        setSelectedEmbeddingModelName('all-MiniLM-L6-v2');
+      }
+    } catch (error) {
+      console.error('Error loading embedding models:', error);
+      console.error('Error details:', error.response?.data || error.message);
+      // On error, use default
+      setSelectedEmbeddingModelName('all-MiniLM-L6-v2');
+      setAvailableEmbeddingModels([]);
+    }
+  };
+
   const loadSessions = async () => {
     try {
       const sessionsData = await pdfChatAPI.getSessions();
@@ -82,8 +124,8 @@ const PDFChat = ({ onBack }) => {
         name: s.name,
         fileCount: s.message_count || 0,
         createdAt: new Date(s.created_at),
-        status: 'ready',
-        hasVectorizedData: true // Sessions from backend have processed PDFs
+        status: s.hasVectorizedData ? 'ready' : 'new',
+        hasVectorizedData: s.hasVectorizedData || false // Use backend value
       }));
       
       if (formattedSessions.length === 0) {
@@ -132,7 +174,6 @@ const PDFChat = ({ onBack }) => {
     };
 
     setFiles(prev => [...prev, newFile]);
-    setUploading(true);
 
     try {
       // Upload PDF to backend
@@ -152,8 +193,6 @@ const PDFChat = ({ onBack }) => {
       console.error('Upload error:', error);
       message.error(`Failed to upload ${file.name}`);
       setFiles(prev => prev.filter(f => f.uid !== file.uid));
-    } finally {
-      setUploading(false);
     }
 
     return false; // Prevent default upload
@@ -179,6 +218,9 @@ const PDFChat = ({ onBack }) => {
       return;
     }
 
+    // Use default embedding model if none selected
+    const embeddingModelName = selectedEmbeddingModelName || 'all-MiniLM-L6-v2';
+
     setProcessingFiles(true);
     try {
       // Prepare files data
@@ -191,7 +233,13 @@ const PDFChat = ({ onBack }) => {
       const sessionName = files.length === 1 
         ? files[0].name.replace('.pdf', '') 
         : `${files.length} PDFs`;
-      const response = await pdfChatAPI.processPDFs(filesData, sessionName, selectedModel);
+      const response = await pdfChatAPI.processPDFs(
+        filesData, 
+        sessionName, 
+        selectedModel, 
+        null,
+        embeddingModelName
+      );
 
       // Update session with real data
       const updatedSession = {
@@ -327,6 +375,63 @@ const PDFChat = ({ onBack }) => {
     inputRef.current?.focus();
   };
 
+  const handleDownloadEmbeddingModel = async (modelName) => {
+    setDownloadingModels(prev => ({ ...prev, [modelName]: true }));
+    try {
+      const response = await embeddingModelsAPI.download(modelName);
+      if (response.success) {
+        message.success(`Model "${modelName}" downloaded successfully`);
+        // Reload models to refresh the list
+        await loadEmbeddingModels();
+        // Also reload modal models
+        const models = await embeddingModelsAPI.getAll();
+        setModalEmbeddingModels(models || []);
+      }
+    } catch (error) {
+      console.error('Download error:', error);
+      message.error(`Failed to download model: ${error.response?.data?.detail || error.message}`);
+    } finally {
+      setDownloadingModels(prev => {
+        const updated = { ...prev };
+        delete updated[modelName];
+        return updated;
+      });
+    }
+  };
+
+  const handleManageEmbeddingModels = async () => {
+    // Load models specifically for the modal
+    setLoadingModalModels(true);
+    try {
+      console.log('Loading embedding models for modal...');
+      const models = await embeddingModelsAPI.getAll();
+      console.log('Loaded embedding models for modal:', models);
+      
+      if (!models || !Array.isArray(models)) {
+        console.warn('Invalid models response in modal:', models);
+        message.warning('Failed to load embedding models. Invalid response format.');
+        setModalEmbeddingModels([]);
+      } else {
+        // Don't filter by is_active for modal - show all available models
+        setModalEmbeddingModels(models);
+        
+        if (models.length === 0) {
+          console.warn('No embedding models returned from API');
+          message.warning('No embedding models found. Please check backend configuration.');
+        }
+      }
+    } catch (error) {
+      console.error('Error loading embedding models for modal:', error);
+      console.error('Error response:', error.response?.data);
+      const errorMessage = error.response?.data?.detail || error.message || 'Check your connection';
+      message.error(`Failed to load embedding models: ${errorMessage}`);
+      setModalEmbeddingModels([]);
+    } finally {
+      setLoadingModalModels(false);
+    }
+    setShowEmbeddingModal(true);
+  };
+
   const handleKeyPress = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -354,11 +459,12 @@ const PDFChat = ({ onBack }) => {
           <Title level={4} style={{ margin: 0 }}>PDF Chat</Title>
         </Space>
         <Space>
+          <Text strong>LLM Model:</Text>
           <Select
             value={selectedModel}
             onChange={setSelectedModel}
             style={{ width: 200 }}
-            placeholder="Select Model"
+            placeholder="Select LLM Model"
           >
             {availableModels.map((model) => (
               <Option key={model.id} value={model.id}>
@@ -366,6 +472,44 @@ const PDFChat = ({ onBack }) => {
               </Option>
             ))}
           </Select>
+          <Divider type="vertical" />
+          <Text strong>Embedding:</Text>
+          {availableEmbeddingModels.length > 0 ? (
+            <Space>
+              <Select
+                value={selectedEmbeddingModelName}
+                onChange={(value) => {
+                  setSelectedEmbeddingModelName(value);
+                }}
+                style={{ width: 250 }}
+                placeholder="Select Embedding Model"
+              >
+                {availableEmbeddingModels.map((model) => (
+                  <Option key={model.model_name} value={model.model_name}>
+                    {model.display_name} ({model.language})
+                  </Option>
+                ))}
+              </Select>
+              <Button 
+                type="link" 
+                size="small"
+                onClick={handleManageEmbeddingModels}
+              >
+                Manage
+              </Button>
+            </Space>
+          ) : (
+            <Space>
+              <Tag color="default">{selectedEmbeddingModelName} (Default)</Tag>
+              <Button 
+                type="link" 
+                size="small"
+                onClick={handleManageEmbeddingModels}
+              >
+                Manage Models
+              </Button>
+            </Space>
+          )}
         </Space>
       </Header>
 
@@ -482,6 +626,14 @@ const PDFChat = ({ onBack }) => {
                     <Alert
                       message="Please select an LLM model from the header first"
                       type="warning"
+                      showIcon
+                      style={{ marginTop: 8 }}
+                    />
+                  )}
+                  {availableEmbeddingModels.length === 0 && (
+                    <Alert
+                      message={`Using default embedding model: ${selectedEmbeddingModelName}. Add models in Settings to use different models.`}
+                      type="info"
                       showIcon
                       style={{ marginTop: 8 }}
                     />
@@ -611,6 +763,104 @@ const PDFChat = ({ onBack }) => {
           </div>
         </div>
       </Content>
+
+      {/* Embedding Models Management Modal */}
+      <Modal
+        title="Manage Embedding Models"
+        open={showEmbeddingModal}
+        onCancel={() => setShowEmbeddingModal(false)}
+        footer={[
+          <Button key="close" onClick={() => setShowEmbeddingModal(false)}>
+            Close
+          </Button>
+        ]}
+        width={800}
+      >
+        <Alert
+          message="Available Embedding Models"
+          description="Select a model from the list below. Models will be downloaded automatically when first used."
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
+        {loadingModalModels ? (
+          <div style={{ textAlign: 'center', padding: '40px' }}>
+            <LoadingOutlined style={{ fontSize: '32px' }} />
+            <p style={{ marginTop: 16 }}>Loading embedding models...</p>
+          </div>
+        ) : (
+          <>
+            <List
+              dataSource={modalEmbeddingModels}
+              renderItem={(model) => {
+                const isDownloading = downloadingModels[model.model_name];
+                const isSelected = selectedEmbeddingModelName === model.model_name;
+                
+                return (
+                  <List.Item
+                    actions={[
+                      isSelected ? (
+                        <Tag color="green">Selected</Tag>
+                      ) : (
+                        <Button
+                          type="primary"
+                          size="small"
+                          onClick={() => {
+                            setSelectedEmbeddingModelName(model.model_name);
+                            setShowEmbeddingModal(false);
+                            message.success(`Selected "${model.display_name}"`);
+                            // Also update the dropdown list
+                            loadEmbeddingModels();
+                          }}
+                        >
+                          Select
+                        </Button>
+                      ),
+                      <Button
+                        type="default"
+                        size="small"
+                        loading={isDownloading}
+                        onClick={() => handleDownloadEmbeddingModel(model.model_name)}
+                      >
+                        {isDownloading ? 'Downloading...' : 'Download'}
+                      </Button>
+                    ]}
+                  >
+                    <List.Item.Meta
+                      title={
+                        <Space>
+                          <Text strong>{model.display_name}</Text>
+                          {model.is_default && <Tag color="blue">Default</Tag>}
+                          <Tag>{model.language}</Tag>
+                          <Tag>{model.provider}</Tag>
+                        </Space>
+                      }
+                      description={
+                        <div>
+                          <Text type="secondary">{model.description}</Text>
+                          <br />
+                          <Text type="secondary" style={{ fontSize: '12px' }}>
+                            Model: {model.model_name} | Dimension: {model.dimension}
+                          </Text>
+                        </div>
+                      }
+                    />
+                  </List.Item>
+                );
+              }}
+            />
+            
+            {modalEmbeddingModels.length === 0 && !loadingModalModels && (
+              <Alert
+                message="No models available"
+                description="Failed to load embedding models. Please check your connection and try again."
+                type="warning"
+                showIcon
+              />
+            )}
+          </>
+        )}
+      </Modal>
     </Layout>
   );
 };

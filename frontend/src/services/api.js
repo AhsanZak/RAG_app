@@ -49,6 +49,50 @@ export const llmModelsAPI = {
   }
 };
 
+// Embedding Models API
+export const embeddingModelsAPI = {
+  // Get all embedding models
+  getAll: async () => {
+    try {
+      const response = await api.get('/api/embedding-models');
+      // Handle both array response and object with models array
+      if (Array.isArray(response.data)) {
+        return response.data;
+      } else if (response.data.models && Array.isArray(response.data.models)) {
+        return response.data.models;
+      } else {
+        console.warn('Unexpected response format:', response.data);
+        return [];
+      }
+    } catch (error) {
+      console.error('Error fetching embedding models:', error);
+      throw error;
+    }
+  },
+
+  // Get single model by name
+  getByName: async (modelName) => {
+    try {
+      const response = await api.get(`/api/embedding-models/by-name/${encodeURIComponent(modelName)}`);
+      return response.data;
+    } catch (error) {
+      console.error('Error fetching embedding model:', error);
+      throw error;
+    }
+  },
+
+  // Download model by name
+  download: async (modelName) => {
+    try {
+      const response = await api.post(`/api/embedding-models/${encodeURIComponent(modelName)}/download`);
+      return response.data;
+    } catch (error) {
+      console.error('Error downloading embedding model:', error);
+      throw error;
+    }
+  }
+};
+
 // Users API
 export const usersAPI = {
   getAll: async () => {
@@ -82,13 +126,22 @@ export const pdfChatAPI = {
   },
 
   // Process PDFs and create session
-  processPDFs: async (files, sessionName, llmModelId) => {
-    const response = await api.post('/api/pdf/process', {
+  processPDFs: async (files, sessionName, llmModelId, embeddingModelId, embeddingModelName) => {
+    const payload = {
       files: files,
       user_id: 1,
       session_name: sessionName,
-      llm_model_id: llmModelId || 1
-    });
+      llm_model_id: llmModelId || 1,
+    };
+    
+    // Include embedding model ID or name
+    if (embeddingModelId) {
+      payload.embedding_model_id = embeddingModelId;
+    } else if (embeddingModelName) {
+      payload.embedding_model_name = embeddingModelName;
+    }
+    
+    const response = await api.post('/api/pdf/process', payload);
     return response.data;
   },
 

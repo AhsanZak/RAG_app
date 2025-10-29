@@ -23,6 +23,7 @@ class RAGService:
         query_text: str,
         collection_name: str,
         model_config: Dict,
+        embedding_model_name: Optional[str] = None,
         n_results: int = 5
     ) -> Dict:
         """
@@ -32,14 +33,18 @@ class RAGService:
             query_text: User query/question
             collection_name: ChromaDB collection name
             model_config: LLM model configuration
+            embedding_model_name: Optional embedding model name to use
             n_results: Number of documents to retrieve
             
         Returns:
             Dictionary with response and sources
         """
         try:
-            # Generate query embedding
-            query_embedding = self.embedding_service.generate_embedding(query_text)
+            # Generate query embedding using specified model
+            query_embedding = self.embedding_service.generate_embedding(
+                query_text, 
+                model_name=embedding_model_name
+            )
             
             # Retrieve relevant documents
             results = self.chromadb_service.query_collection(

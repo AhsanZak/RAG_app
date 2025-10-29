@@ -166,7 +166,10 @@ class ChromaDBService:
             
             return results
         except Exception as e:
-            raise Exception(f"Failed to query collection: {str(e)}")
+            error_msg = str(e)
+            if "does not exist" in error_msg or "not found" in error_msg.lower():
+                raise Exception(f"Collection '{collection_name}' does not exist. Please process PDF files first for this session.")
+            raise Exception(f"Failed to query collection '{collection_name}': {error_msg}")
     
     def delete_collection(self, collection_name: str):
         """Delete a collection"""
