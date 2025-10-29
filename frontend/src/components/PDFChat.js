@@ -14,7 +14,8 @@ import {
   Select,
   Tooltip,
   Modal,
-  Input
+  Input,
+  message
 } from 'antd';
 import {
   UploadOutlined,
@@ -28,7 +29,7 @@ import {
   LoadingOutlined
 } from '@ant-design/icons';
 import Markdown from 'react-markdown';
-import { llmModelsAPI } from '../services/api';
+import { llmModelsAPI, pdfChatAPI } from '../services/api';
 import '../styles/PDFChat.css';
 
 const { Header, Content, Footer } = Layout;
@@ -47,6 +48,7 @@ const PDFChat = ({ onBack }) => {
   const [availableModels, setAvailableModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState(null);
   const [processingFiles, setProcessingFiles] = useState(false);
+  const [sessionReady, setSessionReady] = useState(false); // Track if session has processed PDFs
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
@@ -73,25 +75,47 @@ const PDFChat = ({ onBack }) => {
   };
 
   const loadSessions = async () => {
-    // TODO: Load sessions from backend
-    // For now, use sample data
-    const sampleSessions = [
-      {
-        id: 1,
-        name: 'Research Papers',
-        fileCount: 3,
-        createdAt: new Date(Date.now() - 86400000),
-        status: 'ready'
-      },
-      {
-        id: 2,
-        name: 'Annual Report Analysis',
-        fileCount: 1,
-        createdAt: new Date(Date.now() - 3600000),
-        status: 'processing'
+    try {
+      const sessionsData = await pdfChatAPI.getSessions();
+      const formattedSessions = sessionsData.map(s => ({
+        id: s.id,
+        name: s.name,
+        fileCount: s.message_count || 0,
+        createdAt: new Date(s.created_at),
+        status: 'ready',
+        hasVectorizedData: true // Sessions from backend have processed PDFs
+      }));
+      
+      if (formattedSessions.length === 0) {
+        // Auto-create a new session if none exist
+        await createNewSession();
+      } else {
+        setSessions(formattedSessions);
+        // Auto-select first session if available
+        if (!currentSession && formattedSessions.length > 0) {
+          await handleSelectSession(formattedSessions[0]);
+        }
       }
-    ];
-    setSessions(sampleSessions);
+    } catch (error) {
+      console.error('Error loading sessions:', error);
+      // Even on error, create a new session
+      await createNewSession();
+    }
+  };
+
+  const createNewSession = async () => {
+    // Create a placeholder session (will be replaced when PDFs are processed)
+    const newSession = {
+      id: null, // Will be set after processing
+      name: 'New Session',
+      fileCount: 0,
+      createdAt: new Date(),
+      status: 'new',
+      hasVectorizedData: false
+    };
+    setSessions([newSession]);
+    setCurrentSession(newSession);
+    setSessionReady(false);
   };
 
   const scrollToBottom = () => {
@@ -110,28 +134,27 @@ const PDFChat = ({ onBack }) => {
     setFiles(prev => [...prev, newFile]);
     setUploading(true);
 
-    // Simulate upload progress
-    const progressInterval = setInterval(() => {
-      setUploadProgress(prev => {
-        const newProgress = { ...prev };
-        newProgress[file.uid] = (newProgress[file.uid] || 0) + 10;
-        if (newProgress[file.uid] >= 100) {
-          clearInterval(progressInterval);
-          setFiles(prevFiles =>
-            prevFiles.map(f =>
-              f.uid === file.uid ? { ...f, status: 'uploaded', progress: 100 } : f
-            )
-          );
-          setUploading(false);
-        }
-        return newProgress;
-      });
-    }, 200);
-
-    // TODO: Actual file upload to backend
-    // const formData = new FormData();
-    // formData.append('file', file);
-    // const response = await uploadPDF(formData);
+    try {
+      // Upload PDF to backend
+      const response = await pdfChatAPI.uploadPDF(file);
+      
+      // Update file with extracted chunks
+      setFiles(prevFiles =>
+        prevFiles.map(f =>
+          f.uid === file.uid 
+            ? { ...f, status: 'uploaded', progress: 100, chunks: response.chunks, filename: response.filename }
+            : f
+        )
+      );
+      
+      message.success(`PDF "${file.name}" uploaded successfully`);
+    } catch (error) {
+      console.error('Upload error:', error);
+      message.error(`Failed to upload ${file.name}`);
+      setFiles(prev => prev.filter(f => f.uid !== file.uid));
+    } finally {
+      setUploading(false);
+    }
 
     return false; // Prevent default upload
   };
@@ -146,59 +169,121 @@ const PDFChat = ({ onBack }) => {
   };
 
   const handleProcessFiles = async () => {
-    if (files.length === 0) return;
+    if (files.length === 0) {
+      message.warning('Please upload PDF files first');
+      return;
+    }
+
+    if (!selectedModel) {
+      message.warning('Please select an LLM model first');
+      return;
+    }
 
     setProcessingFiles(true);
     try {
-      // TODO: Process files and create ChromaDB collection
-      // const response = await processPDFs(files, selectedModel);
-      
-      // Simulate processing
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Prepare files data
+      const filesData = files.map(f => ({
+        filename: f.filename || f.name,
+        chunks: f.chunks || []
+      }));
 
-      // Create new session
-      const newSession = {
-        id: Date.now(),
-        name: files.length === 1 ? files[0].name : `${files.length} PDFs`,
+      // Process files and create session
+      const sessionName = files.length === 1 
+        ? files[0].name.replace('.pdf', '') 
+        : `${files.length} PDFs`;
+      const response = await pdfChatAPI.processPDFs(filesData, sessionName, selectedModel);
+
+      // Update session with real data
+      const updatedSession = {
+        id: response.session_id,
+        name: sessionName,
         fileCount: files.length,
         createdAt: new Date(),
         status: 'ready',
-        files: files.map(f => f.name)
+        hasVectorizedData: true,
+        files: files.map(f => f.filename || f.name)
       };
 
-      setSessions(prev => [newSession, ...prev]);
-      setCurrentSession(newSession);
+      // Update sessions list
+      setSessions(prev => {
+        const updated = prev.map(s => 
+          s.id === currentSession?.id ? updatedSession : s
+        );
+        // If session didn't exist, add it
+        if (!updated.find(s => s.id === updatedSession.id)) {
+          return [updatedSession, ...updated];
+        }
+        return updated;
+      });
+
+      setCurrentSession(updatedSession);
+      setSessionReady(true); // Enable chat after processing
       setFiles([]);
       setUploadProgress({});
 
       Modal.success({
-        title: 'Files Processed Successfully',
-        content: 'Your PDF files have been processed and vectorized. You can now start chatting!',
+        title: 'PDFs Processed Successfully',
+        content: `${response.total_documents} document chunks have been vectorized and stored in ChromaDB. You can now start chatting!`,
       });
+      
+      // Load messages for the new session
+      await handleSelectSession(updatedSession);
     } catch (error) {
+      console.error('Processing error:', error);
       Modal.error({
         title: 'Processing Failed',
-        content: 'Failed to process PDF files. Please try again.',
+        content: error.response?.data?.detail || 'Failed to process PDF files. Please try again.',
       });
     } finally {
       setProcessingFiles(false);
     }
   };
 
-  const handleSelectSession = (session) => {
+  const handleSelectSession = async (session) => {
     setCurrentSession(session);
     setChatMessages([]);
+    
+    // Check if session has vectorized data
+    setSessionReady(session.hasVectorizedData === true && session.id !== null);
+    
+    if (session.id && session.hasVectorizedData) {
+      // Load session messages
+      try {
+        const messages = await pdfChatAPI.getSessionMessages(session.id);
+        const formattedMessages = messages.map(m => ({
+          id: m.id,
+          role: m.role,
+          content: m.message,
+          timestamp: new Date(m.created_at),
+          sources: m.metadata?.sources || []
+        }));
+        setChatMessages(formattedMessages);
+      } catch (error) {
+        console.error('Error loading messages:', error);
+        message.error('Failed to load chat history');
+      }
+    }
   };
 
   const handleNewSession = () => {
-    setCurrentSession(null);
+    createNewSession();
     setFiles([]);
     setChatMessages([]);
     setUploadProgress({});
   };
 
   const handleSendMessage = async () => {
-    if (!inputValue.trim() || !currentSession) return;
+    if (!inputValue.trim() || !currentSession || !selectedModel) return;
+    
+    if (!sessionReady) {
+      message.warning('Please process PDF files first before chatting');
+      return;
+    }
+
+    if (!currentSession.id) {
+      message.warning('Session not ready. Please process PDF files first.');
+      return;
+    }
 
     const userMessage = {
       id: Date.now(),
@@ -207,27 +292,37 @@ const PDFChat = ({ onBack }) => {
       timestamp: new Date()
     };
 
+    const messageText = inputValue;
     setChatMessages(prev => [...prev, userMessage]);
     setInputValue('');
 
-    // TODO: Send to backend for RAG processing
-    // const response = await sendChatMessage({
-    //   message: inputValue,
-    //   sessionId: currentSession.id,
-    //   modelId: selectedModel
-    // });
+    try {
+      // Send to backend for RAG processing
+      const response = await pdfChatAPI.chat(
+        currentSession.id,
+        messageText,
+        selectedModel
+      );
 
-    // Simulate assistant response
-    setTimeout(() => {
       const assistantResponse = {
-        id: Date.now() + 1,
+        id: response.message_id || Date.now() + 1,
         role: 'assistant',
-        content: `I understand you're asking about your PDF: "${inputValue}"\n\nBased on the documents you've uploaded, I can help you with that. This is a simulated response. The actual implementation will query ChromaDB for relevant context and generate responses using your selected LLM model.`,
+        content: response.response,
         timestamp: new Date(),
-        sources: ['document1.pdf', 'document2.pdf']
+        sources: response.sources || []
       };
+      
       setChatMessages(prev => [...prev, assistantResponse]);
-    }, 1000);
+      
+      // Reload sessions to update message count
+      loadSessions();
+    } catch (error) {
+      console.error('Chat error:', error);
+      message.error(error.response?.data?.detail || 'Failed to send message');
+      
+      // Remove user message on error
+      setChatMessages(prev => prev.filter(m => m.id !== userMessage.id));
+    }
 
     inputRef.current?.focus();
   };
@@ -286,80 +381,124 @@ const PDFChat = ({ onBack }) => {
                     className={`session-item ${currentSession?.id === session.id ? 'active' : ''}`}
                     onClick={() => handleSelectSession(session)}
                   >
-                    <List.Item.Meta
-                      avatar={<FilePdfOutlined />}
-                      title={session.name}
-                      description={`${session.fileCount} file(s)`}
-                    />
-                    {session.status === 'processing' && (
-                      <LoadingOutlined />
-                    )}
-                    {session.status === 'ready' && (
-                      <Tag color="green">Ready</Tag>
-                    )}
+                  <List.Item.Meta
+                    avatar={<FilePdfOutlined />}
+                    title={session.name}
+                    description={
+                      session.hasVectorizedData 
+                        ? `${session.fileCount} file(s) - Ready`
+                        : 'New session - Upload PDFs'
+                    }
+                  />
+                  {session.status === 'processing' && (
+                    <LoadingOutlined />
+                  )}
+                  {session.hasVectorizedData && session.status === 'ready' && (
+                    <Tag color="green">Ready</Tag>
+                  )}
+                  {!session.hasVectorizedData && (
+                    <Tag color="orange">New</Tag>
+                  )}
                   </List.Item>
                 )}
               />
             </Card>
 
-            {!currentSession && (
-              <Card title="Upload PDF Files" style={{ marginTop: 16 }}>
-                <Dragger {...uploadProps}>
-                  <p className="ant-upload-drag-icon">
-                    <FilePdfOutlined style={{ fontSize: '48px', color: '#ff4d4f' }} />
-                  </p>
-                  <p className="ant-upload-text">Click or drag PDF files here to upload</p>
-                  <p className="ant-upload-hint">Support for single or multiple PDF uploads</p>
-                </Dragger>
+            {/* Upload PDF Files - Always visible on left */}
+            <Card 
+              title={
+                <Space>
+                  <FilePdfOutlined />
+                  <span>Upload & Process PDF Files</span>
+                </Space>
+              }
+              style={{ marginTop: 16 }}
+            >
+              {!sessionReady && (
+                <Alert
+                  message="Upload PDF files and process them to enable chat"
+                  description="PDFs will be vectorized and stored in ChromaDB for RAG-based chat"
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                />
+              )}
+              
+              <Dragger {...uploadProps} disabled={processingFiles}>
+                <p className="ant-upload-drag-icon">
+                  <FilePdfOutlined style={{ fontSize: '48px', color: '#ff4d4f' }} />
+                </p>
+                <p className="ant-upload-text">Click or drag PDF files here to upload</p>
+                <p className="ant-upload-hint">Support for single or multiple PDF uploads</p>
+              </Dragger>
 
-                {files.length > 0 && (
-                  <div style={{ marginTop: 16 }}>
-                    <List
-                      dataSource={files}
-                      renderItem={(file) => (
-                        <List.Item
-                          actions={[
-                            <Button
-                              type="text"
-                              danger
-                              icon={<DeleteOutlined />}
-                              onClick={() => handleRemoveFile(file)}
-                            />
-                          ]}
-                        >
-                          <List.Item.Meta
-                            avatar={<FilePdfOutlined />}
-                            title={file.name}
-                            description={
-                              file.status === 'uploading' ? (
-                                <Progress
-                                  percent={uploadProgress[file.uid] || 0}
-                                  size="small"
-                                  status="active"
-                                />
-                              ) : (
-                                <Tag color="green">
-                                  <CheckCircleOutlined /> Uploaded
-                                </Tag>
-                              )
-                            }
+              {files.length > 0 && (
+                <div style={{ marginTop: 16 }}>
+                  <List
+                    dataSource={files}
+                    renderItem={(file) => (
+                      <List.Item
+                        actions={[
+                          <Button
+                            type="text"
+                            danger
+                            icon={<DeleteOutlined />}
+                            onClick={() => handleRemoveFile(file)}
+                            disabled={processingFiles}
                           />
-                        </List.Item>
-                      )}
+                        ]}
+                      >
+                        <List.Item.Meta
+                          avatar={<FilePdfOutlined />}
+                          title={file.name}
+                          description={
+                            file.status === 'uploading' ? (
+                              <Progress
+                                percent={uploadProgress[file.uid] || 0}
+                                size="small"
+                                status="active"
+                              />
+                            ) : (
+                              <Tag color="green">
+                                <CheckCircleOutlined /> Uploaded
+                              </Tag>
+                            )
+                          }
+                        />
+                      </List.Item>
+                    )}
+                  />
+                  <Button
+                    type="primary"
+                    block
+                    loading={processingFiles}
+                    onClick={handleProcessFiles}
+                    disabled={!selectedModel || processingFiles}
+                    style={{ marginTop: 16 }}
+                  >
+                    {processingFiles ? 'Processing & Vectorizing...' : 'Process & Vectorize PDFs'}
+                  </Button>
+                  {!selectedModel && (
+                    <Alert
+                      message="Please select an LLM model from the header first"
+                      type="warning"
+                      showIcon
+                      style={{ marginTop: 8 }}
                     />
-                    <Button
-                      type="primary"
-                      block
-                      loading={processingFiles}
-                      onClick={handleProcessFiles}
-                      style={{ marginTop: 16 }}
-                    >
-                      Process & Vectorize PDFs
-                    </Button>
-                  </div>
-                )}
-              </Card>
-            )}
+                  )}
+                </div>
+              )}
+              
+              {sessionReady && (
+                <Alert
+                  message="Session ready for chat"
+                  description="PDFs have been processed and vectorized. You can now chat!"
+                  type="success"
+                  showIcon
+                  style={{ marginTop: 16 }}
+                />
+              )}
+            </Card>
           </div>
 
           {/* Right Panel - Chat Area */}
@@ -367,9 +506,9 @@ const PDFChat = ({ onBack }) => {
             {!currentSession ? (
               <div className="empty-chat-state">
                 <FilePdfOutlined style={{ fontSize: '64px', color: '#d9d9d9', marginBottom: 16 }} />
-                <Title level={3}>No Session Selected</Title>
+                <Title level={3}>Ready to Start</Title>
                 <Paragraph>
-                  Upload PDF files and create a session to start chatting, or select an existing session.
+                  Upload PDF files on the left side, then process them to enable chat.
                 </Paragraph>
               </div>
             ) : (
@@ -378,10 +517,21 @@ const PDFChat = ({ onBack }) => {
                   {chatMessages.length === 0 ? (
                     <div className="empty-messages-state">
                       <RobotOutlined style={{ fontSize: '48px', color: '#d9d9d9', marginBottom: 16 }} />
-                      <Title level={4}>Start Chatting</Title>
+                      <Title level={4}>
+                        {sessionReady ? 'Start Chatting' : 'Process PDFs First'}
+                      </Title>
                       <Paragraph>
-                        Ask questions about your PDF documents. The AI will use the vectorized content
-                        from ChromaDB to provide accurate answers.
+                        {sessionReady ? (
+                          <>
+                            Ask questions about your PDF documents. The AI will use the vectorized content
+                            from ChromaDB to provide accurate answers.
+                          </>
+                        ) : (
+                          <>
+                            Upload PDF files on the left side and click "Process & Vectorize PDFs" 
+                            to enable chat. PDFs will be converted to vectors and stored in ChromaDB.
+                          </>
+                        )}
                       </Paragraph>
                     </div>
                   ) : (
@@ -427,20 +577,34 @@ const PDFChat = ({ onBack }) => {
                       value={inputValue}
                       onChange={(e) => setInputValue(e.target.value)}
                       onKeyPress={handleKeyPress}
-                      placeholder="Ask questions about your PDF documents..."
+                      placeholder={
+                        sessionReady 
+                          ? "Ask questions about your PDF documents..."
+                          : "Please process PDF files first to enable chat..."
+                      }
                       autoSize={{ minRows: 1, maxRows: 4 }}
                       className="chat-input"
+                      disabled={!sessionReady}
                     />
                     <Button
                       type="primary"
                       icon={<SendOutlined />}
                       onClick={handleSendMessage}
-                      disabled={!inputValue.trim()}
+                      disabled={!inputValue.trim() || !sessionReady}
                       className="send-btn"
                     >
                       Send
                     </Button>
                   </div>
+                  {!sessionReady && (
+                    <Alert
+                      message="Chat disabled"
+                      description="Please upload and process PDF files first to enable chat"
+                      type="warning"
+                      showIcon
+                      style={{ marginTop: 8 }}
+                    />
+                  )}
                 </Footer>
               </>
             )}

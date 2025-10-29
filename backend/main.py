@@ -1,13 +1,21 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
 import requests
 import json
+import aiofiles
+import os
+from datetime import datetime
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider
+from services.pdf_processor import PDFProcessor
+from services.embedding_service import EmbeddingService
+from services.chromadb_service import ChromaDBService
+from services.rag_service import RAGService
+from services.llm_service import LLMService
 
 app = FastAPI(
     title="RAG Chat API",
@@ -23,6 +31,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Initialize services
+pdf_processor = PDFProcessor()
+embedding_service = EmbeddingService()
+chromadb_service = ChromaDBService()
+rag_service = RAGService()
+llm_service = LLMService()
 
 # Pydantic models
 class ChatMessage(BaseModel):
@@ -322,6 +337,217 @@ async def test_openai_connection(base_url: str, api_key: str, model_name: str):
             "message": "Unexpected error occurred",
             "details": str(e)
         }
+
+# PDF Chat Endpoints
+@app.post("/api/pdf/upload")
+async def upload_pdf(
+    file: UploadFile = File(...),
+    user_id: int = Form(1),  # Default user, should be from auth
+    db: Session = Depends(get_db)
+):
+    """Upload and process PDF file"""
+    try:
+        # Read file content
+        contents = await file.read()
+        
+        # Extract text from PDF
+        extraction_result = pdf_processor.extract_text_from_pdf(contents, file.filename)
+        
+        # Store file info temporarily (in production, save to storage)
+        return {
+            "success": True,
+            "filename": file.filename,
+            "chunks": extraction_result["chunks"],
+            "metadata": extraction_result["metadata"],
+            "total_chunks": extraction_result["total_chunks"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
+
+@app.post("/api/pdf/process")
+async def process_pdfs(
+    session_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Process PDFs and create ChromaDB collection"""
+    try:
+        files = session_data.get("files", [])
+        user_id = session_data.get("user_id", 1)
+        session_name = session_data.get("session_name", "New Session")
+        
+        if not files:
+            raise HTTPException(status_code=400, detail="No files provided")
+        
+        # Create or get session
+        session = ChatSession(
+            user_id=user_id,
+            session_name=session_name,
+            llm_model_id=session_data.get("llm_model_id", 1),
+            created_at=datetime.utcnow()
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        
+        # Collection name based on session ID
+        collection_name = f"session_{session.id}"
+        
+        all_texts = []
+        all_metadatas = []
+        all_ids = []
+        
+        # Process each file
+        for file_data in files:
+            chunks = file_data.get("chunks", [])
+            filename = file_data.get("filename")
+            
+            for idx, chunk in enumerate(chunks):
+                all_texts.append(chunk["text"])
+                # Ensure metadata is always a non-empty dict (ChromaDB requirement)
+                metadata = chunk.get("metadata", {}) or {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                
+                # Always add required fields to ensure non-empty metadata
+                metadata["session_id"] = str(session.id)
+                metadata["filename"] = filename or "unknown.pdf"
+                metadata["page_number"] = chunk.get("page", idx + 1)
+                metadata["chunk_index"] = idx
+                
+                all_metadatas.append(metadata)
+                all_ids.append(f"{filename}_{chunk.get('page', idx)}_{idx}")
+        
+        # Generate embeddings
+        embeddings = embedding_service.generate_embeddings(all_texts)
+        
+        # Add to ChromaDB
+        chromadb_service.add_documents(
+            collection_name=collection_name,
+            texts=all_texts,
+            embeddings=embeddings,
+            metadatas=all_metadatas,
+            ids=all_ids
+        )
+        
+        return {
+            "success": True,
+            "session_id": session.id,
+            "collection_name": collection_name,
+            "total_documents": len(all_texts),
+            "message": "PDFs processed and vectorized successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process PDFs: {str(e)}")
+
+@app.post("/api/pdf/chat")
+async def pdf_chat(
+    chat_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Chat with PDF documents using RAG"""
+    try:
+        session_id = chat_data.get("session_id")
+        message = chat_data.get("message")
+        model_id = chat_data.get("model_id")
+        user_id = chat_data.get("user_id", 1)
+        
+        if not session_id or not message:
+            raise HTTPException(status_code=400, detail="session_id and message are required")
+        
+        # Get session
+        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get model config
+        model = db.query(LLMModel).filter(LLMModel.id == model_id).first()
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found")
+        
+        model_config = {
+            "provider": model.provider.value,
+            "model_name": model.model_name,
+            "base_url": model.base_url
+        }
+        
+        # Collection name
+        collection_name = f"session_{session_id}"
+        
+        # Query using RAG
+        rag_result = rag_service.query(
+            query_text=message,
+            collection_name=collection_name,
+            model_config=model_config,
+            n_results=5
+        )
+        
+        # Save user message
+        user_message = ChatMessageModel(
+            session_id=session_id,
+            role="user",
+            message=message,
+            created_at=datetime.utcnow()
+        )
+        db.add(user_message)
+        
+        # Save assistant message
+        assistant_message = ChatMessageModel(
+            session_id=session_id,
+            role="assistant",
+            message=rag_result["response"],
+            meta_data={"sources": rag_result["sources"]},
+            created_at=datetime.utcnow()
+        )
+        db.add(assistant_message)
+        db.commit()
+        
+        return {
+            "response": rag_result["response"],
+            "sources": rag_result["sources"],
+            "message_id": assistant_message.id,
+            "session_id": session_id
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+@app.get("/api/sessions")
+async def get_sessions(
+    user_id: int = 1,
+    db: Session = Depends(get_db)
+):
+    """Get all sessions for a user"""
+    sessions = db.query(ChatSession).filter(ChatSession.user_id == user_id).all()
+    return [
+        {
+            "id": s.id,
+            "name": s.session_name,
+            "created_at": s.created_at.isoformat(),
+            "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+            "message_count": len(s.chat_messages)
+        }
+        for s in sessions
+    ]
+
+@app.get("/api/sessions/{session_id}/messages")
+async def get_session_messages(
+    session_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get all messages for a session"""
+    messages = db.query(ChatMessageModel).filter(
+        ChatMessageModel.session_id == session_id
+    ).order_by(ChatMessageModel.created_at).all()
+    
+    return [
+        {
+            "id": m.id,
+            "role": m.role,
+            "message": m.message,
+            "metadata": m.meta_data,
+            "created_at": m.created_at.isoformat()
+        }
+        for m in messages
+    ]
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

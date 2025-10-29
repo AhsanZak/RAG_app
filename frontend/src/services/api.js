@@ -65,4 +65,55 @@ export const healthAPI = {
   },
 };
 
+// PDF Chat API
+export const pdfChatAPI = {
+  // Upload PDF file
+  uploadPDF: async (file) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('user_id', '1');
+    
+    const response = await api.post('/api/pdf/upload', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+    return response.data;
+  },
+
+  // Process PDFs and create session
+  processPDFs: async (files, sessionName, llmModelId) => {
+    const response = await api.post('/api/pdf/process', {
+      files: files,
+      user_id: 1,
+      session_name: sessionName,
+      llm_model_id: llmModelId || 1
+    });
+    return response.data;
+  },
+
+  // Chat with PDF documents
+  chat: async (sessionId, message, modelId) => {
+    const response = await api.post('/api/pdf/chat', {
+      session_id: sessionId,
+      message: message,
+      model_id: modelId,
+      user_id: 1
+    });
+    return response.data;
+  },
+
+  // Get all sessions
+  getSessions: async (userId = 1) => {
+    const response = await api.get(`/api/sessions?user_id=${userId}`);
+    return response.data;
+  },
+
+  // Get session messages
+  getSessionMessages: async (sessionId) => {
+    const response = await api.get(`/api/sessions/${sessionId}/messages`);
+    return response.data;
+  },
+};
+
 export default api;
