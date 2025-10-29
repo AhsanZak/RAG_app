@@ -9,6 +9,7 @@ import {
   HomeOutlined
 } from '@ant-design/icons';
 import LLMModelManagement from './components/LLMModelManagement';
+import ChatInterface from './components/ChatInterface';
 
 const { Header, Content, Footer, Sider } = Layout;
 const { Title, Paragraph } = Typography;
@@ -21,6 +22,11 @@ function App() {
       key: 'home',
       icon: <HomeOutlined />,
       label: 'Home',
+    },
+    {
+      key: 'chat',
+      icon: <MessageOutlined />,
+      label: 'Chat',
     },
     {
       key: 'models',
@@ -36,6 +42,8 @@ function App() {
 
   const renderContent = () => {
     switch (currentPage) {
+      case 'chat':
+        return <ChatInterface />;
       case 'models':
         return <LLMModelManagement />;
       case 'settings':
@@ -49,6 +57,11 @@ function App() {
         return renderHomePage();
     }
   };
+
+  // For chat page, render without outer layout
+  if (currentPage === 'chat') {
+    return <ChatInterface />;
+  }
 
   const renderHomePage = () => (
     <div>
@@ -133,10 +146,10 @@ function App() {
                 <Button 
                   type="primary" 
                   size="large" 
-                  icon={<RocketOutlined />}
-                  disabled
+                  icon={<MessageOutlined />}
+                  onClick={() => setCurrentPage('chat')}
                 >
-                  Start Chatting (Coming Soon)
+                  Start Chatting
                 </Button>
               </Space>
             </Space>
