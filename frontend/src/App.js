@@ -6,22 +6,31 @@ import {
   ApiOutlined, 
   RocketOutlined,
   SettingOutlined,
-  HomeOutlined
+  HomeOutlined,
+  FilePdfOutlined
 } from '@ant-design/icons';
 import LLMModelManagement from './components/LLMModelManagement';
 import ChatInterface from './components/ChatInterface';
+import ChatTypeSelector from './components/ChatTypeSelector';
+import PDFChat from './components/PDFChat';
 
 const { Header, Content, Footer, Sider } = Layout;
 const { Title, Paragraph } = Typography;
 
 function App() {
   const [currentPage, setCurrentPage] = useState('home');
+  const [selectedChatType, setSelectedChatType] = useState(null);
 
   const menuItems = [
     {
       key: 'home',
       icon: <HomeOutlined />,
       label: 'Home',
+    },
+    {
+      key: 'chat-types',
+      icon: <FilePdfOutlined />,
+      label: 'Chat Types',
     },
     {
       key: 'chat',
@@ -40,8 +49,26 @@ function App() {
     },
   ];
 
+  const handleSelectChatType = (chatType) => {
+    setSelectedChatType(chatType);
+    setCurrentPage('chat-type');
+  };
+
+  const handleBackToChatTypes = () => {
+    setSelectedChatType(null);
+    setCurrentPage('chat-types');
+  };
+
   const renderContent = () => {
     switch (currentPage) {
+      case 'chat-types':
+        return <ChatTypeSelector onSelectChatType={handleSelectChatType} />;
+      case 'chat-type':
+        if (selectedChatType === 'pdf') {
+          return <PDFChat onBack={handleBackToChatTypes} />;
+        }
+        // TODO: Add other chat types (excel, text, word, database, general)
+        return <ChatTypeSelector onSelectChatType={handleSelectChatType} />;
       case 'chat':
         return <ChatInterface />;
       case 'models':
@@ -58,9 +85,14 @@ function App() {
     }
   };
 
-  // For chat page, render without outer layout
-  if (currentPage === 'chat') {
-    return <ChatInterface />;
+  // For full-screen pages (chat-type), render without outer layout
+  if (currentPage === 'chat-type') {
+    return renderContent();
+  }
+
+  // For chat-types page, render without outer layout
+  if (currentPage === 'chat-types') {
+    return renderContent();
   }
 
   const renderHomePage = () => (
@@ -135,6 +167,14 @@ function App() {
                 </ul>
               </div>
               <Space>
+                <Button 
+                  type="primary" 
+                  size="large" 
+                  icon={<FilePdfOutlined />}
+                  onClick={() => setCurrentPage('chat-types')}
+                >
+                  Start Document Chat
+                </Button>
                 <Button 
                   type="primary" 
                   size="large" 
