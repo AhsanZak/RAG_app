@@ -17,6 +17,8 @@ from services.embedding_service import EmbeddingService
 from services.chromadb_service import ChromaDBService
 from services.rag_service import RAGService
 from services.llm_service import LLMService
+from langdetect import detect, DetectorFactory
+DetectorFactory.seed = 0
 
 app = FastAPI(
     title="RAG Chat API",
@@ -568,19 +570,34 @@ async def upload_pdf(
     try:
         # Read file content
         contents = await file.read()
+        print(f"[UPLOAD] filename={file.filename}, bytes_len={len(contents) if contents else 0}")
         
         # Extract text from PDF
         extraction_result = pdf_processor.extract_text_from_pdf(contents, file.filename)
+        print(f"[UPLOAD] extraction_method={extraction_result.get('metadata',{}).get('extraction_method')}, total_chunks={extraction_result.get('total_chunks')}")
+        # Determine PDF type
+        total_chunks = extraction_result.get("total_chunks", 0)
+        extraction_method = extraction_result.get("metadata", {}).get("extraction_method")
+        pdf_type = "text_pdf" if total_chunks > 0 and extraction_method in ["pdfplumber", "pypdf2"] else (
+            "image_pdf" if extraction_method == "ocr" or total_chunks == 0 else "unknown"
+        )
+        # Sample text for preview
+        sample_text = "\n\n".join([c.get("text", "") for c in extraction_result.get("chunks", [])[:2]]).strip()
         
         # Store file info temporarily (in production, save to storage)
-        return {
+        response = {
             "success": True,
             "filename": file.filename,
             "chunks": extraction_result["chunks"],
             "metadata": extraction_result["metadata"],
-            "total_chunks": extraction_result["total_chunks"]
+            "total_chunks": extraction_result["total_chunks"],
+            "pdf_type": pdf_type,
+            "sample_text": sample_text
         }
+        print(f"[UPLOAD] pdf_type={pdf_type}, sample_len={len(sample_text)}")
+        return response
     except Exception as e:
+        print(f"[UPLOAD][ERROR] {e}")
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
 
 @app.post("/api/pdf/process")
@@ -593,6 +610,7 @@ async def process_pdfs(
         files = session_data.get("files", [])
         user_id = session_data.get("user_id", 1)
         session_name = session_data.get("session_name", "New Session")
+        print(f"[PROCESS] session_name={session_name}, files_count={len(files)}")
         
         if not files:
             raise HTTPException(status_code=400, detail="No files provided")
@@ -629,6 +647,7 @@ async def process_pdfs(
         
         # Collection name based on session ID
         collection_name = f"session_{session.id}"
+        print(f"[PROCESS] collection={collection_name}")
         
         all_texts = []
         all_metadatas = []
@@ -638,6 +657,7 @@ async def process_pdfs(
         for file_data in files:
             chunks = file_data.get("chunks", [])
             filename = file_data.get("filename")
+            print(f"[PROCESS] file={filename}, chunks={len(chunks)}")
             
             for idx, chunk in enumerate(chunks):
                 all_texts.append(chunk["text"])
@@ -655,10 +675,34 @@ async def process_pdfs(
                 all_metadatas.append(metadata)
                 all_ids.append(f"{filename}_{chunk.get('page', idx)}_{idx}")
         
+        # Guard: ensure there is text to vectorize; if not, inform user clearly
+        if len(all_texts) == 0:
+            print("[PROCESS] No texts to vectorize even after OCR")
+            raise HTTPException(status_code=400, detail="No text found to vectorize. The PDF may be image-only or protected. Try the OCR option or upload a different file.")
+
+        # Detect language from combined text (first few chunks)
+        try:
+            sample_for_lang = " \n ".join(all_texts[:3])[:2000]
+            detected_lang = detect(sample_for_lang) if sample_for_lang and sample_for_lang.strip() else "unknown"
+        except Exception:
+            detected_lang = "unknown"
+
+        # Auto-select embedding model if not provided (based on detected language)
+        if not embedding_model_name:
+            if detected_lang in ["ar", "fa", "ur"]:
+                embedding_model_name = "BAAI/bge-m3"  # strong multilingual including Arabic
+            elif detected_lang in ["en"]:
+                embedding_model_name = "sentence-transformers/all-mpnet-base-v2"
+            else:
+                embedding_model_name = "intfloat/multilingual-e5-base"
+
         # Generate embeddings using selected embedding model
+        print(f"[PROCESS] detected_lang={detected_lang}, model={embedding_model_name}, texts={len(all_texts)}")
         embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+        print(f"[PROCESS] embeddings_shape={(len(embeddings) if embeddings is not None else 0)}")
         
         # Add to ChromaDB
+        print(f"[PROCESS] adding to chroma: ids={len(all_ids)}, metadatas={len(all_metadatas)}, texts={len(all_texts)}")
         chromadb_service.add_documents(
             collection_name=collection_name,
             texts=all_texts,
@@ -702,6 +746,8 @@ async def process_pdfs(
             "collection_name": collection_name,
             "total_documents": len(all_texts),
             "message": "PDFs processed and vectorized successfully",
+            "detected_language": detected_lang,
+            "used_embedding_model": embedding_model_name,
             "preview": {
                 "samples": preview_samples,
                 "summary": summary_text

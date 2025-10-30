@@ -188,6 +188,11 @@ const PDFChat = ({ onBack }) => {
         )
       );
       
+      // Inform user if scanned/image-based PDF detected
+      if (response.pdf_type === 'image_pdf') {
+        message.info('Scanned PDF detected. Using OCR to extract text. Processing may take longer.');
+      }
+
       message.success(`PDF "${file.name}" uploaded successfully`);
     } catch (error) {
       console.error('Upload error:', error);
@@ -527,48 +532,18 @@ const PDFChat = ({ onBack }) => {
 
       <Content className="pdf-chat-content">
         <div className="pdf-chat-container">
-          {/* Left Panel - File Upload & Sessions */}
+          {/* Left Panel - Upload (static) + Sessions (scrollable) */}
           <div className="pdf-chat-sidebar">
-            <Card title="Sessions" extra={<Button type="link" onClick={handleNewSession}>New</Button>}>
-              <List
-                dataSource={sessions}
-                renderItem={(session) => (
-                  <List.Item
-                    className={`session-item ${currentSession?.id === session.id ? 'active' : ''}`}
-                    onClick={() => handleSelectSession(session)}
-                  >
-                  <List.Item.Meta
-                    avatar={<FilePdfOutlined />}
-                    title={session.name}
-                    description={
-                      session.hasVectorizedData 
-                        ? `${session.fileCount} file(s) - Ready`
-                        : 'New session - Upload PDFs'
-                    }
-                  />
-                  {session.status === 'processing' && (
-                    <LoadingOutlined />
-                  )}
-                  {session.hasVectorizedData && session.status === 'ready' && (
-                    <Tag color="green">Ready</Tag>
-                  )}
-                  {!session.hasVectorizedData && (
-                    <Tag color="orange">New</Tag>
-                  )}
-                  </List.Item>
-                )}
-              />
-            </Card>
-
-            {/* Upload PDF Files - Always visible on left */}
+            {/* Upload - compact and static */}
             <Card 
+              className="sidebar-upload"
+              size="small"
               title={
                 <Space>
                   <FilePdfOutlined />
-                  <span>Upload & Process PDF Files</span>
+                  <span>Upload & Process</span>
                 </Space>
               }
-              style={{ marginTop: 16 }}
             >
               {!sessionReady && (
                 <Alert
@@ -576,20 +551,20 @@ const PDFChat = ({ onBack }) => {
                   description="PDFs will be vectorized and stored in ChromaDB for RAG-based chat"
                   type="info"
                   showIcon
-                  style={{ marginBottom: 16 }}
+                  style={{ marginBottom: 12 }}
                 />
               )}
               
               <Dragger {...uploadProps} disabled={processingFiles}>
                 <p className="ant-upload-drag-icon">
-                  <FilePdfOutlined style={{ fontSize: '48px', color: '#ff4d4f' }} />
+                  <FilePdfOutlined style={{ fontSize: '32px', color: '#ff4d4f' }} />
                 </p>
-                <p className="ant-upload-text">Click or drag PDF files here to upload</p>
-                <p className="ant-upload-hint">Support for single or multiple PDF uploads</p>
+                <p className="ant-upload-text" style={{ marginBottom: 4 }}>Click or drag PDFs to upload</p>
+                <p className="ant-upload-hint" style={{ marginBottom: 0 }}>Single or multiple files</p>
               </Dragger>
 
               {files.length > 0 && (
-                <div style={{ marginTop: 16 }}>
+                <div style={{ marginTop: 12 }}>
                   <List
                     dataSource={files}
                     renderItem={(file) => (
@@ -659,10 +634,45 @@ const PDFChat = ({ onBack }) => {
                   description="PDFs have been processed and vectorized. You can now chat!"
                   type="success"
                   showIcon
-                  style={{ marginTop: 16 }}
+                  style={{ marginTop: 12 }}
                 />
               )}
             </Card>
+
+            {/* Sessions - scrollable list */}
+            <div className="sidebar-sessions">
+              <Card title="Sessions" size="small" extra={<Button type="link" onClick={handleNewSession}>New</Button>}>
+                <List
+                  size="small"
+                  dataSource={sessions}
+                  renderItem={(session) => (
+                    <List.Item
+                      className={`session-item ${currentSession?.id === session.id ? 'active' : ''}`}
+                      onClick={() => handleSelectSession(session)}
+                    >
+                      <List.Item.Meta
+                        avatar={<FilePdfOutlined />}
+                        title={<span style={{ fontSize: 13 }}>{session.name}</span>}
+                        description={
+                          <span style={{ fontSize: 12 }}>
+                            {session.hasVectorizedData ? `${session.fileCount} file(s) - Ready` : 'New session - Upload PDFs'}
+                          </span>
+                        }
+                      />
+                      {session.status === 'processing' && (
+                        <LoadingOutlined />
+                      )}
+                      {session.hasVectorizedData && session.status === 'ready' && (
+                        <Tag color="green" style={{ marginInlineStart: 6 }}>Ready</Tag>
+                      )}
+                      {!session.hasVectorizedData && (
+                        <Tag color="orange" style={{ marginInlineStart: 6 }}>New</Tag>
+                      )}
+                    </List.Item>
+                  )}
+                />
+              </Card>
+            </div>
           </div>
 
           {/* Right Panel - Chat Area */}
