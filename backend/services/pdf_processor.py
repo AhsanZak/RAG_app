@@ -8,6 +8,16 @@ import PyPDF2
 from typing import List, Dict
 import io
 import os
+from typing import Optional
+
+# Optional OCR imports
+try:
+    from pdf2image import convert_from_bytes
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
 
 
 class PDFProcessor:
@@ -28,13 +38,25 @@ class PDFProcessor:
             Dictionary with extracted text chunks and metadata
         """
         try:
-            # Try pdfplumber first (better for complex layouts)
+            print(f"[PDF] extract_text_from_pdf: filename={filename}, bytes_len={len(pdf_bytes) if pdf_bytes else 0}")
+            # First pass: native text extraction
             try:
-                return self._extract_with_pdfplumber(pdf_bytes, filename)
+                result = self._extract_with_pdfplumber(pdf_bytes, filename)
+                print(f"[PDF] pdfplumber: chunks={result.get('total_chunks')}, pages={result.get('metadata',{}).get('total_pages')}")
             except Exception as e:
-                # Fallback to PyPDF2
-                return self._extract_with_pypdf2(pdf_bytes, filename)
+                print(f"[PDF] pdfplumber failed: {e}")
+                result = self._extract_with_pypdf2(pdf_bytes, filename)
+                print(f"[PDF] pypdf2: chunks={result.get('total_chunks')}, pages={result.get('metadata',{}).get('total_pages')}")
+
+            # If no text found, attempt OCR fallback
+            if result['total_chunks'] == 0:
+                print(f"[PDF] no native text found, OCR_AVAILABLE={OCR_AVAILABLE}")
+                ocr_result = self._extract_with_ocr(pdf_bytes, filename)
+                print(f"[PDF] OCR result: chunks={ocr_result.get('total_chunks')}, method={ocr_result.get('metadata',{}).get('extraction_method')}")
+                return ocr_result
+            return result
         except Exception as e:
+            print(f"[PDF] extract_text_from_pdf error: {e}")
             raise Exception(f"Failed to extract text from PDF: {str(e)}")
     
     def _extract_with_pdfplumber(self, pdf_bytes: bytes, filename: str = None) -> Dict:
@@ -87,6 +109,60 @@ class PDFProcessor:
                     }
                 })
         
+        return {
+            'chunks': chunks,
+            'metadata': metadata,
+            'total_chunks': len(chunks)
+        }
+
+    def _extract_with_ocr(self, pdf_bytes: bytes, filename: Optional[str] = None) -> Dict:
+        """Extract text using OCR if PDF is image/scanned. Requires Tesseract installed."""
+        chunks: List[Dict] = []
+        metadata: Dict = {
+            'total_pages': 0,
+            'extraction_method': 'ocr',
+            'ocr_available': OCR_AVAILABLE
+        }
+        if not OCR_AVAILABLE:
+            print("[PDF][OCR] OCR not available in environment (pytesseract/pdf2image/Pillow missing)")
+            # No OCR available in environment
+            return {
+                'chunks': [],
+                'metadata': metadata,
+                'total_chunks': 0
+            }
+
+        # Convert pages to images
+        try:
+            images = convert_from_bytes(pdf_bytes)
+        except Exception as e:
+            print(f"[PDF][OCR] convert_from_bytes failed: {e}")
+            return {
+                'chunks': [],
+                'metadata': metadata,
+                'total_chunks': 0
+            }
+        metadata['total_pages'] = len(images)
+        print(f"[PDF][OCR] pages_as_images={len(images)}")
+        for idx, img in enumerate(images, 1):
+            try:
+                text = pytesseract.image_to_string(img)
+                if text and text.strip():
+                    chunks.append({
+                        'page': idx,
+                        'text': text.strip(),
+                        'metadata': {
+                            'page_number': idx,
+                            'filename': filename or 'unknown.pdf',
+                            'extracted_via': 'ocr'
+                        }
+                    })
+                else:
+                    print(f"[PDF][OCR] page={idx} empty text")
+            except Exception as e:
+                print(f"[PDF][OCR] page={idx} OCR failed: {e}")
+                continue
+
         return {
             'chunks': chunks,
             'metadata': metadata,
