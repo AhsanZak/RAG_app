@@ -667,12 +667,46 @@ async def process_pdfs(
             ids=all_ids
         )
         
+        # Build preview and summary for user verification
+        preview_samples = []
+        max_preview_chunks = min(3, len(all_texts))
+        for i in range(max_preview_chunks):
+            preview_samples.append(all_texts[i].strip())
+        # Simple summary: concatenate first few chunks and trim
+        combined_text = "\n\n".join(preview_samples) if preview_samples else ""
+        summary_text = combined_text[:2000]
+
+        # Save an initial assistant message with the summary/preview
+        try:
+            assistant_intro = (
+                "Your documents have been processed and vectorized. "
+                "Here's a quick preview of the extracted content so you can verify everything looks right.\n\n"
+                f"{summary_text}"
+            )
+            assistant_message = ChatMessageModel(
+                session_id=session.id,
+                role="assistant",
+                message=assistant_intro,
+                created_at=datetime.utcnow()
+            )
+            db.add(assistant_message)
+            db.commit()
+            db.refresh(assistant_message)
+            assistant_message_id = assistant_message.id
+        except Exception:
+            assistant_message_id = None
+
         return {
             "success": True,
             "session_id": session.id,
             "collection_name": collection_name,
             "total_documents": len(all_texts),
-            "message": "PDFs processed and vectorized successfully"
+            "message": "PDFs processed and vectorized successfully",
+            "preview": {
+                "samples": preview_samples,
+                "summary": summary_text
+            },
+            "assistant_message_id": assistant_message_id
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process PDFs: {str(e)}")

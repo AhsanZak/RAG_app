@@ -265,6 +265,18 @@ const PDFChat = ({ onBack }) => {
       });
 
       setCurrentSession(updatedSession);
+      
+      // Inject preview/summary as the first assistant message for verification
+      if (response.preview && (response.preview.summary || (response.preview.samples && response.preview.samples.length))) {
+        const previewText = response.preview.summary || response.preview.samples.join('\n\n');
+        const assistantPreview = {
+          id: response.assistant_message_id || `preview_${Date.now()}`,
+          role: 'assistant',
+          content: previewText,
+          timestamp: new Date()
+        };
+        setChatMessages([assistantPreview]);
+      }
       setSessionReady(true); // Enable chat after processing
       setFiles([]);
       setUploadProgress({});
