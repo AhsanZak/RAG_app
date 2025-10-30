@@ -1,6 +1,6 @@
 # RAG Chat Application
 
-A modern AI-powered chat application built with FastAPI backend and React.js frontend, featuring Retrieval-Augmented Generation (RAG) capabilities for analyzing and chatting with news articles and other data from a vector database.
+An AI-powered chat application built with FastAPI (backend) and React + Ant Design (frontend) featuring Retrieval-Augmented Generation (RAG). You can upload PDFs, vectorize them with language-aware embeddings, and chat over their content using a local or remote LLM.
 
 ## Project Structure
 
@@ -21,23 +21,23 @@ RAG_App/
 └── README.md              # This file
 ```
 
-## Features (Planned)
+## Key Features (Current)
 
-- 🤖 **AI-Powered Chat**: Intelligent conversations using RAG technology
-- 📊 **Vector Database**: Semantic search and retrieval capabilities
-- 🚀 **FastAPI Backend**: High-performance API with automatic documentation
-- ⚛️ **React Frontend**: Modern UI with Ant Design components
-- 📰 **News Analysis**: Chat with news articles and other content
-- 🔍 **Semantic Search**: Find relevant information using vector embeddings
+- 🤖 Chat over documents with RAG (ChromaDB for vector storage)
+- 📄 PDF ingestion with OCR fallback for scanned/image-based PDFs
+- 🌐 Language detection and auto-embedding model selection
+- 🧩 Embedding models from configuration (no DB required), on-demand download
+- 🧠 LLM model management (e.g., Ollama/OpenAI) with model selector in UI
+- 🖥️ Clean PDF chat UI (static upload area + scrollable sessions list)
+- 📝 First message preview/summary after processing for quick verification
 
 ## Current Status
 
-This is the initial setup with:
-- ✅ Basic FastAPI backend structure
-- ✅ React frontend with welcome screen
-- ✅ Ant Design UI components
-- ✅ Project structure and configuration files
-- ✅ CORS configuration for frontend-backend communication
+- ✅ FastAPI backend with PDF upload, processing (OCR), chat endpoints
+- ✅ Embedding models config with downloadable models (HuggingFace)
+- ✅ React UI for PDF chat, LLM model selection, embedding selection
+- ✅ ChromaDB integration with robust metadata handling
+- ✅ Sessions, messages, and collection existence checks
 
 ## Getting Started
 
@@ -46,6 +46,15 @@ This is the initial setup with:
 - Python 3.8+
 - Node.js 16+
 - npm or yarn
+- System OCR dependencies (for scanned PDFs):
+  - Tesseract OCR
+    - Windows: install Tesseract and add `tesseract.exe` to PATH
+    - Linux: `sudo apt install tesseract-ocr`
+    - macOS: `brew install tesseract`
+  - Poppler (for `pdf2image`)
+    - Windows: install Poppler and add its `bin` folder to PATH
+    - Linux: `sudo apt install poppler-utils`
+    - macOS: `brew install poppler`
 
 ### Backend Setup
 
@@ -74,6 +83,10 @@ This is the initial setup with:
    - API Documentation: `http://localhost:8000/docs`
    - Alternative docs: `http://localhost:8000/redoc`
 
+Backend dependencies to note (pip-installed):
+
+- `pdf2image`, `pytesseract`, `Pillow`, `langdetect`, `pdfplumber`, `PyPDF2`, `chromadb`, `sentence-transformers`, `huggingface-hub`
+
 ### Frontend Setup
 
 1. Navigate to the frontend directory:
@@ -95,47 +108,56 @@ This is the initial setup with:
 
 ## API Endpoints
 
-### Current Endpoints
+Core
 
-- `GET /` - Root endpoint (health check)
-- `GET /health` - Health check endpoint
-- `POST /chat` - Main chat endpoint (placeholder)
-- `GET /api/endpoints` - List all available endpoints
+- `GET /` – root health
+- `GET /health` – health check
+- `GET /api/endpoints` – list endpoints
 
-### Example Usage
+Embedding models (from configuration file `backend/config/embedding_models.py`)
 
-```bash
-# Health check
-curl http://localhost:8000/health
+- `GET /api/embedding-models` – list available embedding models
+- `GET /api/embedding-models/by-name/{model_name}` – details for one model
+- `POST /api/embedding-models/{model_name}/download` – download model (on-demand)
+- `GET /api/embedding-models/status|test|direct` – diagnostics
 
-# Chat endpoint (placeholder)
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Hello, how are you?"}'
-```
+PDF workflow
 
-## Next Steps
+- `POST /api/pdf/upload` – upload a PDF (returns extracted chunks, `pdf_type`, and sample text)
+- `POST /api/pdf/process` – vectorize chunks into ChromaDB (OCR fallback, language detect, preview summary)
+- `POST /api/pdf/chat` – RAG query against the session’s collection
+- `GET /api/sessions` – list sessions (includes `hasVectorizedData` and `collection_name`)
+- `GET /api/sessions/{session_id}/messages` – list messages for a session
 
-This is just the beginning! Future development will include:
+## How it Works (Highlights)
 
-1. **Vector Database Integration** (ChromaDB/Pinecone)
-2. **Document Processing Pipeline**
-3. **Embedding Generation**
-4. **RAG Implementation**
-5. **Chat Interface**
-6. **News Data Integration**
-7. **Advanced Search Features**
+1. Upload: `/api/pdf/upload` extracts text with `pdfplumber`/`PyPDF2`. If no text is found, OCR fallback (`pdf2image` + `pytesseract`) attempts extraction. Returns `pdf_type` for UI info.
+2. Process: `/api/pdf/process` chunks data, auto-detects language (`langdetect`), auto-selects embedding model (Arabic → `BAAI/bge-m3`, English → `all-mpnet-base-v2`, otherwise → `intfloat/multilingual-e5-base`), generates embeddings, and stores them in ChromaDB. It also saves a first assistant message with a preview/summary.
+3. Chat: `/api/pdf/chat` retrieves relevant chunks from ChromaDB and generates answers using the selected LLM.
+
+Guards
+
+- If no text is found after OCR, processing returns `400` with a clear message instead of failing inside ChromaDB.
+- Before chat, the server checks that the session’s collection exists.
 
 ## Technology Stack
 
-- **Backend**: FastAPI, Python
+- **Backend**: FastAPI, SQLAlchemy, ChromaDB
 - **Frontend**: React.js, Ant Design
-- **Database**: Vector Database (TBD)
-- **AI/ML**: Embeddings, RAG (TBD)
+- **Embeddings**: sentence-transformers/HF models (config-driven)
+- **OCR**: Tesseract via `pytesseract`, `pdf2image`, `Pillow`
+- **LLM**: pluggable (e.g., Ollama/OpenAI) via model selector
 
-## Contributing
+## Troubleshooting
 
-This project is in active development. More features and documentation will be added step by step.
+- Scanned PDF still fails
+  - Ensure Tesseract and Poppler are installed and on PATH.
+  - Check backend logs for lines starting with `[PDF]` / `[PDF][OCR]` / `[UPLOAD]` / `[PROCESS]`.
+- Embedding model list is empty
+  - Check `GET /api/embedding-models/status` and `GET /api/embedding-models`.
+  - Confirm `backend/config/embedding_models.py` exists and is importable.
+- ChromaDB telemetry warnings
+  - Telemetry is disabled in the service; warnings can be ignored if present.
 
 ## License
 

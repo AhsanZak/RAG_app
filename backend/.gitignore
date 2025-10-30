@@ -135,3 +135,20 @@ data/
 models/
 *.pkl
 *.joblib
+
+# ChromaDB persistence (ignore vectors/db)
+chroma_db/
+**/chroma_db/**
+.chroma/
+**/.chroma/**
+
+# Local sqlite
+*.sqlite3
+rag_chat.db
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
