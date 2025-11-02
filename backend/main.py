@@ -10,13 +10,14 @@ import os
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider, EmbeddingModel
+from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider, EmbeddingModel, DatabaseConnection, DatabaseSchema
 from config.embedding_models import AVAILABLE_EMBEDDINGS, get_default_embedding_model, get_embedding_model_info, list_embedding_models
 from services.pdf_processor import PDFProcessor
 from services.embedding_service import EmbeddingService
 from services.chromadb_service import ChromaDBService
 from services.rag_service import RAGService
 from services.llm_service import LLMService
+from services.database_schema_service import DatabaseSchemaService
 from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
 
@@ -41,6 +42,7 @@ embedding_service = EmbeddingService()
 chromadb_service = ChromaDBService()
 rag_service = RAGService()
 llm_service = LLMService()
+database_schema_service = DatabaseSchemaService()
 
 # Verify embedding models configuration on startup
 try:
@@ -911,6 +913,519 @@ async def get_session_messages(
         }
         for m in messages
     ]
+
+# Database Schema Chat Endpoints
+@app.post("/api/database/connections")
+async def create_database_connection(
+    connection_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Create a new database connection"""
+    try:
+        connection = DatabaseConnection(
+            user_id=connection_data.get("user_id", 1),
+            name=connection_data.get("name"),
+            database_type=connection_data.get("database_type"),
+            host=connection_data.get("host"),
+            port=connection_data.get("port"),
+            database_name=connection_data.get("database_name"),
+            username=connection_data.get("username"),
+            password=connection_data.get("password"),
+            connection_string=connection_data.get("connection_string"),
+            schema_name=connection_data.get("schema_name"),
+            is_active=connection_data.get("is_active", 1)
+        )
+        db.add(connection)
+        db.commit()
+        db.refresh(connection)
+        return {
+            "success": True,
+            "connection": {
+                "id": connection.id,
+                "name": connection.name,
+                "database_type": connection.database_type,
+                "database_name": connection.database_name,
+                "created_at": connection.created_at.isoformat()
+            }
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create connection: {str(e)}")
+
+@app.get("/api/database/connections")
+async def get_database_connections(
+    user_id: int = 1,
+    db: Session = Depends(get_db)
+):
+    """Get all database connections for a user"""
+    connections = db.query(DatabaseConnection).filter(
+        DatabaseConnection.user_id == user_id,
+        DatabaseConnection.is_active == 1
+    ).all()
+    
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "database_type": c.database_type,
+            "host": c.host,
+            "port": c.port,
+            "database_name": c.database_name,
+            "username": c.username,
+            "schema_name": c.schema_name,
+            "created_at": c.created_at.isoformat(),
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None
+        }
+        for c in connections
+    ]
+
+@app.get("/api/database/connections/{connection_id}")
+async def get_database_connection(
+    connection_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get a single database connection"""
+    connection = db.query(DatabaseConnection).filter(
+        DatabaseConnection.id == connection_id
+    ).first()
+    
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    return {
+        "id": connection.id,
+        "name": connection.name,
+        "database_type": connection.database_type,
+        "host": connection.host,
+        "port": connection.port,
+        "database_name": connection.database_name,
+        "username": connection.username,
+        "schema_name": connection.schema_name,
+        "created_at": connection.created_at.isoformat(),
+        "updated_at": connection.updated_at.isoformat() if connection.updated_at else None
+    }
+
+@app.put("/api/database/connections/{connection_id}")
+async def update_database_connection(
+    connection_id: int,
+    connection_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Update a database connection"""
+    connection = db.query(DatabaseConnection).filter(
+        DatabaseConnection.id == connection_id
+    ).first()
+    
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    try:
+        for key, value in connection_data.items():
+            if hasattr(connection, key):
+                setattr(connection, key, value)
+        
+        db.commit()
+        db.refresh(connection)
+        
+        return {
+            "success": True,
+            "connection": {
+                "id": connection.id,
+                "name": connection.name,
+                "database_type": connection.database_type,
+                "updated_at": connection.updated_at.isoformat() if connection.updated_at else None
+            }
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update connection: {str(e)}")
+
+@app.delete("/api/database/connections/{connection_id}")
+async def delete_database_connection(
+    connection_id: int,
+    db: Session = Depends(get_db)
+):
+    """Delete a database connection"""
+    connection = db.query(DatabaseConnection).filter(
+        DatabaseConnection.id == connection_id
+    ).first()
+    
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    try:
+        # Soft delete by setting is_active to 0
+        connection.is_active = 0
+        db.commit()
+        return {"success": True, "message": "Connection deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete connection: {str(e)}")
+
+@app.post("/api/database/test-connection")
+async def test_database_connection(connection_data: dict):
+    """Test database connection"""
+    try:
+        result = database_schema_service.test_connection(
+            database_type=connection_data.get("database_type"),
+            connection_string=connection_data.get("connection_string"),
+            host=connection_data.get("host"),
+            port=connection_data.get("port"),
+            database_name=connection_data.get("database_name"),
+            username=connection_data.get("username"),
+            password=connection_data.get("password")
+        )
+        return result
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Connection test failed: {str(e)}"
+        }
+
+@app.post("/api/database/extract-schema")
+async def extract_database_schema(
+    connection_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Extract schema from database"""
+    try:
+        connection_id = connection_data.get("connection_id")
+        
+        # If connection_id is provided, get connection from database
+        if connection_id:
+            connection = db.query(DatabaseConnection).filter(
+                DatabaseConnection.id == connection_id
+            ).first()
+            if not connection:
+                raise HTTPException(status_code=404, detail="Connection not found")
+            
+            # Use connection data from database
+            extract_result = database_schema_service.extract_schema(
+                database_type=connection.database_type,
+                connection_string=connection.connection_string,
+                host=connection.host,
+                port=connection.port,
+                database_name=connection.database_name,
+                username=connection.username,
+                password=connection.password,
+                schema_name=connection.schema_name
+            )
+        else:
+            # Use provided connection data directly
+            extract_result = database_schema_service.extract_schema(
+                database_type=connection_data.get("database_type"),
+                connection_string=connection_data.get("connection_string"),
+                host=connection_data.get("host"),
+                port=connection_data.get("port"),
+                database_name=connection_data.get("database_name"),
+                username=connection_data.get("username"),
+                password=connection_data.get("password"),
+                schema_name=connection_data.get("schema_name")
+            )
+        
+        if not extract_result.get("success"):
+            raise HTTPException(status_code=500, detail=extract_result.get("error", "Failed to extract schema"))
+        
+        return {
+            "success": True,
+            "schema_data": extract_result.get("schema_data"),
+            "schema_text": extract_result.get("schema_text"),
+            "metadata": extract_result.get("metadata")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to extract schema: {str(e)}")
+
+@app.post("/api/database/save-schema")
+async def save_database_schema(
+    schema_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Save extracted schema to database"""
+    try:
+        connection_id = schema_data.get("connection_id")
+        schema_info = schema_data.get("schema_data")
+        schema_text = schema_data.get("schema_text")
+        
+        if not connection_id or not schema_info:
+            raise HTTPException(status_code=400, detail="connection_id and schema_data are required")
+        
+        # Check if schema already exists for this connection
+        existing_schema = db.query(DatabaseSchema).filter(
+            DatabaseSchema.connection_id == connection_id
+        ).first()
+        
+        if existing_schema:
+            # Update existing schema
+            existing_schema.schema_data = schema_info
+            existing_schema.schema_text = schema_text
+            existing_schema.is_processed = 0  # Reset processed flag if schema changed
+            db.commit()
+            db.refresh(existing_schema)
+            schema_id = existing_schema.id
+        else:
+            # Create new schema
+            new_schema = DatabaseSchema(
+                connection_id=connection_id,
+                schema_data=schema_info,
+                schema_text=schema_text,
+                is_processed=0
+            )
+            db.add(new_schema)
+            db.commit()
+            db.refresh(new_schema)
+            schema_id = new_schema.id
+        
+        return {
+            "success": True,
+            "schema_id": schema_id,
+            "message": "Schema saved successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to save schema: {str(e)}")
+
+@app.post("/api/database/process-schema")
+async def process_database_schema(
+    session_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Process schema and create ChromaDB collection"""
+    try:
+        connection_id = session_data.get("connection_id")
+        user_id = session_data.get("user_id", 1)
+        session_name = session_data.get("session_name", "New Session")
+        
+        if not connection_id:
+            raise HTTPException(status_code=400, detail="connection_id is required")
+        
+        # Get schema from database
+        schema = db.query(DatabaseSchema).filter(
+            DatabaseSchema.connection_id == connection_id
+        ).first()
+        
+        if not schema:
+            raise HTTPException(status_code=404, detail="Schema not found. Please extract schema first.")
+        
+        # Create or get session
+        embedding_model_name = session_data.get("embedding_model_name")
+        if not embedding_model_name:
+            embedding_model_name = get_default_embedding_model()
+        
+        session = ChatSession(
+            user_id=user_id,
+            session_name=session_name,
+            llm_model_id=session_data.get("llm_model_id", 1),
+            embedding_model_id=None,
+            created_at=datetime.utcnow()
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        
+        # Collection name based on session ID
+        collection_name = f"db_session_{session.id}"
+        
+        # Prepare schema text for chunking
+        schema_text = schema.schema_text or ""
+        
+        # Chunk schema text (similar to PDF processing)
+        chunks = []
+        chunk_size = 1000
+        overlap = 200
+        
+        # Split schema text into chunks
+        lines = schema_text.split('\n')
+        current_chunk = []
+        current_length = 0
+        
+        for line in lines:
+            line_length = len(line)
+            if current_length + line_length > chunk_size and current_chunk:
+                chunks.append({
+                    'text': '\n'.join(current_chunk),
+                    'metadata': {
+                        'session_id': str(session.id),
+                        'connection_id': str(connection_id),
+                        'chunk_index': len(chunks)
+                    }
+                })
+                # Start new chunk with overlap
+                overlap_lines = current_chunk[-3:] if len(current_chunk) >= 3 else current_chunk
+                current_chunk = overlap_lines + [line]
+                current_length = sum(len(l) for l in current_chunk)
+            else:
+                current_chunk.append(line)
+                current_length += line_length
+        
+        # Add last chunk
+        if current_chunk:
+            chunks.append({
+                'text': '\n'.join(current_chunk),
+                'metadata': {
+                    'session_id': str(session.id),
+                    'connection_id': str(connection_id),
+                    'chunk_index': len(chunks)
+                }
+            })
+        
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No schema content to vectorize")
+        
+        # Generate embeddings
+        all_texts = [chunk['text'] for chunk in chunks]
+        embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+        
+        # Prepare metadata and IDs
+        all_metadatas = [chunk['metadata'] for chunk in chunks]
+        all_ids = [f"schema_{connection_id}_{i}" for i in range(len(chunks))]
+        
+        # Add to ChromaDB
+        chromadb_service.add_documents(
+            collection_name=collection_name,
+            texts=all_texts,
+            embeddings=embeddings,
+            metadatas=all_metadatas,
+            ids=all_ids
+        )
+        
+        # Update schema to mark as processed
+        schema.is_processed = 1
+        schema.session_id = session.id
+        db.commit()
+        
+        # Build preview
+        preview_text = schema_text[:2000] if schema_text else "Schema processed successfully"
+        
+        return {
+            "success": True,
+            "session_id": session.id,
+            "collection_name": collection_name,
+            "total_chunks": len(chunks),
+            "message": "Schema processed and vectorized successfully",
+            "used_embedding_model": embedding_model_name,
+            "preview": {
+                "summary": preview_text
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process schema: {str(e)}")
+
+@app.post("/api/database/chat")
+async def database_chat(
+    chat_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Chat with database schema using RAG"""
+    try:
+        session_id = chat_data.get("session_id")
+        message = chat_data.get("message")
+        model_id = chat_data.get("model_id")
+        user_id = chat_data.get("user_id", 1)
+        
+        if not session_id or not message:
+            raise HTTPException(status_code=400, detail="session_id and message are required")
+        
+        # Get session
+        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get model config
+        model = db.query(LLMModel).filter(LLMModel.id == model_id).first()
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found")
+        
+        model_config = {
+            "provider": model.provider.value,
+            "model_name": model.model_name,
+            "base_url": model.base_url
+        }
+        
+        # Collection name
+        collection_name = f"db_session_{session_id}"
+        
+        # Check if collection exists
+        try:
+            collections = chromadb_service.list_collections()
+            if collection_name not in collections:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Collection '{collection_name}' does not exist. Please process schema first for this session."
+                )
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise e
+            pass
+        
+        # Query using RAG
+        rag_result = rag_service.query(
+            query_text=message,
+            collection_name=collection_name,
+            model_config=model_config,
+            embedding_model_name=None,  # Use default embedding model
+            n_results=5
+        )
+        
+        # Save user message
+        user_message = ChatMessageModel(
+            session_id=session_id,
+            role="user",
+            message=message,
+            created_at=datetime.utcnow()
+        )
+        db.add(user_message)
+        
+        # Save assistant message
+        assistant_message = ChatMessageModel(
+            session_id=session_id,
+            role="assistant",
+            message=rag_result["response"],
+            meta_data={"sources": rag_result["sources"]},
+            created_at=datetime.utcnow()
+        )
+        db.add(assistant_message)
+        db.commit()
+        
+        return {
+            "response": rag_result["response"],
+            "sources": rag_result["sources"],
+            "message_id": assistant_message.id,
+            "session_id": session_id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+@app.get("/api/database/schemas/{connection_id}")
+async def get_database_schema(
+    connection_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get saved schema for a connection"""
+    schema = db.query(DatabaseSchema).filter(
+        DatabaseSchema.connection_id == connection_id
+    ).first()
+    
+    if not schema:
+        raise HTTPException(status_code=404, detail="Schema not found")
+    
+    return {
+        "id": schema.id,
+        "connection_id": schema.connection_id,
+        "session_id": schema.session_id,
+        "schema_data": schema.schema_data,
+        "schema_text": schema.schema_text,
+        "is_processed": schema.is_processed,
+        "created_at": schema.created_at.isoformat(),
+        "updated_at": schema.updated_at.isoformat() if schema.updated_at else None
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

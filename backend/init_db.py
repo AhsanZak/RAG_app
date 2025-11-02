@@ -4,7 +4,7 @@ Run this script to create the database and all required tables
 """
 
 from sqlalchemy import create_engine
-from models import Base, User, LLMModel, LLMProvider, ChatSession, ChatMessage, Document, EmbeddingModel
+from models import Base, User, LLMModel, LLMProvider, ChatSession, ChatMessage, Document, EmbeddingModel, DatabaseConnection, DatabaseSchema
 import os
 from datetime import datetime
 
@@ -182,7 +182,7 @@ def init_database():
     print("="*50)
     print("\n📊 Database Summary:")
     print(f"   - Database URL: {DATABASE_URL}")
-    print("   - Tables created: users, llm_models, embedding_models, chat_sessions, chat_messages, documents")
+    print("   - Tables created: users, llm_models, embedding_models, chat_sessions, chat_messages, documents, database_connections, database_schemas")
     print("\n💡 Next steps:")
     print("   1. Update API keys in llm_models table")
     print("   2. Download embedding models as needed")
