@@ -91,8 +91,13 @@ const LLMModelManagement = () => {
     try {
       const modelData = {
         ...values,
+        model_name: (values.model_name || '').trim(),
         is_active: values.is_active ? 1 : 0
       };
+      if (!modelData.model_name) {
+        message.error('Model name is required');
+        return;
+      }
 
       if (editingModel) {
         await llmModelsAPI.update(editingModel.id, modelData);
@@ -115,13 +120,17 @@ const LLMModelManagement = () => {
   const handleTestConnection = async () => {
     try {
       const values = await form.validateFields(['provider', 'base_url', 'model_name', 'api_key']);
+      if (!values.model_name || !values.model_name.trim()) {
+        message.error('Model name is required');
+        return;
+      }
       setTestingConnection(true);
       setTestResult(null);
       
       const testData = {
         provider: values.provider,
         base_url: values.base_url,
-        model_name: values.model_name,
+        model_name: values.model_name.trim(),
         api_key: values.api_key || ''
       };
       
@@ -342,6 +351,11 @@ const LLMModelManagement = () => {
             is_active: true
           }}
         >
+          {/* watch provider to ensure correct conditional rendering */}
+          {(() => { /* force render on provider change */ return null; })()}
+          {/** useWatch-like re-render by reading value each render */}
+          {form.getFieldValue('provider')}
+
           <Form.Item
             name="provider"
             label="Provider"
@@ -352,11 +366,13 @@ const LLMModelManagement = () => {
               onChange={(value) => {
                 const config = getProviderConfig(value);
                 const defaults = getDefaultModels(value);
+                const nextModelName = '';
+                const nextDescription = defaults[0]?.description || 'Custom model';
                 form.setFieldsValue({
                   base_url: config.baseUrl,
                   api_key: '',
-                  model_name: defaults[0]?.name || '',
-                  description: defaults[0]?.description || ''
+                  model_name: nextModelName,
+                  description: nextDescription
                 });
               }}
             >
@@ -373,25 +389,10 @@ const LLMModelManagement = () => {
             label="Model Name"
             rules={[{ required: true, message: 'Please enter model name' }]}
           >
-            {form.getFieldValue('provider') === 'ollama' ? (
-              <Input
-                placeholder="Enter custom model name (e.g., llama2, mistral, mixtral)"
-                allowClear
-              />
-            ) : (
-              <Select
-                placeholder="Select or enter model name"
-                showSearch
-                allowClear
-                notFoundContent="No models found"
-              >
-                {getDefaultModels(form.getFieldValue('provider') || 'openai').map(model => (
-                  <Option key={model.name} value={model.name}>
-                    {model.name} - {model.description}
-                  </Option>
-                ))}
-              </Select>
-            )}
+            <Input
+              placeholder="Enter model name (e.g., gpt-4, mistral, llama2:13b)"
+              allowClear
+            />
           </Form.Item>
 
           <Form.Item
@@ -403,6 +404,36 @@ const LLMModelManagement = () => {
               placeholder={getProviderConfig(form.getFieldValue('provider') || 'openai').baseUrl}
             />
           </Form.Item>
+
+          {form.getFieldValue('provider') === 'ollama' && (
+            <Form.Item>
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 12 }}
+                message="Ollama custom model"
+                description={
+                  <span>
+                    Enter your model name exactly as pulled in Ollama (e.g., <code>mistral</code> or <code>llama2:13b</code>). Set Base URL to your Ollama server (e.g., <code>http://localhost:11434</code> or your LAN IP).
+                  </span>
+                }
+              />
+            </Form.Item>
+          )}
+
+          {form.getFieldValue('provider') === 'ollama' && (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="Ollama custom model"
+              description={
+                <span>
+                  Enter your model name exactly as pulled in Ollama (e.g., <code>mistral</code> or <code>llama2:13b</code>). Set Base URL to your Ollama server (e.g., <code>http://localhost:11434</code> or your LAN IP).
+                </span>
+              }
+            />
+          )}
 
           <Form.Item
             name="api_key"
