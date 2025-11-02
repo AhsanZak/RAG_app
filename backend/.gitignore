@@ -152,3 +152,25 @@ rag_chat.db
 # IDE
 .vscode/
 .idea/
+
+# Windows batch files and PowerShell scripts (optional - remove these lines if you want to keep .bat/.ps1 files)
+*.bat
+*.ps1
+*.cmd
+*.sh
+
+# Test files (optional - remove if you want to track test files)
+test_*.py
+*_test.py
+
+# Temporary Python files
+setup_run.py
+migrate_*.py
+
+# Documentation markdown (optional - remove if you want to track README files)
+README_SERVER.md
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini

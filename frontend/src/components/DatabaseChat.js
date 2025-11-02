@@ -87,8 +87,11 @@ const DatabaseChat = ({ onBack }) => {
       const models = await llmModelsAPI.getAll();
       const activeModels = models.filter(model => model.is_active === 1);
       setAvailableModels(activeModels);
+      // Set default model if not already set
       if (activeModels.length > 0 && !selectedModel) {
-        setSelectedModel(activeModels[0].id);
+        // Prefer Ollama models for database chat
+        const ollamaModel = activeModels.find(m => m.provider === 'ollama');
+        setSelectedModel(ollamaModel ? ollamaModel.id : activeModels[0].id);
       }
     } catch (error) {
       console.error('Error loading models:', error);
@@ -319,7 +322,7 @@ const DatabaseChat = ({ onBack }) => {
   };
 
   const handleSendMessage = async () => {
-    if (!inputValue.trim() || !currentSession || !selectedModel) return;
+    if (!inputValue.trim() || !currentSession) return;
     
     if (!sessionReady) {
       message.warning('Please process schema first before chatting');
@@ -328,6 +331,13 @@ const DatabaseChat = ({ onBack }) => {
 
     if (!currentSession.id) {
       message.warning('Session not ready. Please process schema first.');
+      return;
+    }
+
+    // Use selected model or default to first available model
+    const modelToUse = selectedModel || (availableModels.length > 0 ? availableModels[0].id : null);
+    if (!modelToUse) {
+      message.warning('Please select an LLM model first');
       return;
     }
 
@@ -346,7 +356,7 @@ const DatabaseChat = ({ onBack }) => {
       const response = await databaseChatAPI.chat(
         currentSession.id,
         messageText,
-        selectedModel
+        modelToUse
       );
 
       const assistantResponse = {
@@ -354,7 +364,11 @@ const DatabaseChat = ({ onBack }) => {
         role: 'assistant',
         content: response.response,
         timestamp: new Date(),
-        sources: response.sources || []
+        sources: response.sources || [],
+        sql: response.sql,
+        sqlExecuted: response.sql_executed,
+        queryResult: response.query_result,
+        metadata: response.metadata || {}
       };
       
       setChatMessages(prev => [...prev, assistantResponse]);
@@ -627,6 +641,52 @@ const DatabaseChat = ({ onBack }) => {
                           <div className="message-content">
                             <div className="message-bubble">
                               <Markdown>{message.content}</Markdown>
+                              
+                              {/* Show SQL query if executed */}
+                              {message.sql && message.sqlExecuted && (
+                                <div style={{ marginTop: 12, padding: 8, background: '#f5f5f5', borderRadius: 4 }}>
+                                  <Text strong style={{ fontSize: '12px' }}>SQL Query:</Text>
+                                  <pre style={{ marginTop: 4, fontSize: '11px', whiteSpace: 'pre-wrap' }}>
+                                    {message.sql}
+                                  </pre>
+                                </div>
+                              )}
+                              
+                              {/* Show query results if available */}
+                              {message.queryResult && message.queryResult.length > 0 && (
+                                <div style={{ marginTop: 12 }}>
+                                  <Text strong style={{ fontSize: '12px' }}>Query Results ({message.queryResult.length} rows):</Text>
+                                  <div style={{ marginTop: 8, maxHeight: '300px', overflow: 'auto' }}>
+                                    <table style={{ width: '100%', fontSize: '12px', borderCollapse: 'collapse' }}>
+                                      <thead>
+                                        <tr style={{ background: '#f0f0f0' }}>
+                                          {Object.keys(message.queryResult[0]).map((key) => (
+                                            <th key={key} style={{ padding: '4px 8px', textAlign: 'left', border: '1px solid #ddd' }}>
+                                              {key}
+                                            </th>
+                                          ))}
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {message.queryResult.slice(0, 10).map((row, idx) => (
+                                          <tr key={idx}>
+                                            {Object.values(row).map((val, valIdx) => (
+                                              <td key={valIdx} style={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                                {String(val || '')}
+                                              </td>
+                                            ))}
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                    {message.queryResult.length > 10 && (
+                                      <Text type="secondary" style={{ fontSize: '11px', marginTop: 4 }}>
+                                        Showing first 10 of {message.queryResult.length} rows
+                                      </Text>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
                             </div>
                             {message.sources && message.sources.length > 0 && (
                               <div className="message-sources">
