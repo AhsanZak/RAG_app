@@ -136,46 +136,45 @@ Respond in JSON format:
         }
     
     def _expand_query_with_synonyms(self, query: str) -> List[str]:
-        """Expand query with synonyms for better semantic matching"""
+        """
+        Expand query semantically without hardcoded mappings
+        Uses linguistic variations that embedding models can understand
+        """
         query_lower = query.lower()
         expanded = []
         
-        # Common synonym expansions
-        synonym_expansions = {
-            'movie': ['film', 'movies', 'films', 'cinema'],
-            'movies': ['film', 'films', 'cinema'],
-            'film': ['movie', 'movies', 'films', 'cinema'],
-            'user': ['users', 'person', 'people', 'account'],
-            'customer': ['customers', 'client', 'clients', 'buyer'],
-            'order': ['orders', 'purchase', 'purchases', 'transaction'],
-            'product': ['products', 'item', 'items', 'goods'],
-            'employee': ['employees', 'staff', 'worker', 'personnel'],
-        }
+        # Simple linguistic variations that help semantic matching
+        # These are general language patterns, not domain-specific
+        variations = []
         
-        # Find synonyms and create expanded queries
-        for word, synonyms in synonym_expansions.items():
-            if word in query_lower:
-                for synonym in synonyms:
-                    expanded_query = query_lower.replace(word, synonym)
-                    if expanded_query != query_lower:
-                        expanded.append(expanded_query)
+        # Plural/singular variations (general language, not hardcoded)
+        words = query_lower.split()
+        for i, word in enumerate(words):
+            # Simple pluralization patterns (very basic, embedding models handle most of this)
+            if word.endswith('s') and len(word) > 3:
+                # Try singular
+                singular = word[:-1]
+                new_words = words.copy()
+                new_words[i] = singular
+                variations.append(' '.join(new_words))
+            elif not word.endswith('s') and len(word) > 2:
+                # Try plural
+                plural = word + 's'
+                new_words = words.copy()
+                new_words[i] = plural
+                variations.append(' '.join(new_words))
         
-        # Also add query with common terms
-        common_terms = {
-            'show me': ['list', 'get', 'fetch', 'retrieve', 'display'],
-            'find': ['search', 'get', 'retrieve', 'fetch'],
-            'how many': ['count', 'total', 'number of'],
-        }
+        # Add simple query reformulations that help semantic search
+        # These are general query patterns, not domain-specific
+        if 'show' in query_lower or 'display' in query_lower:
+            variations.append(query_lower.replace('show', 'list').replace('display', 'list'))
+        if 'find' in query_lower:
+            variations.append(query_lower.replace('find', 'get'))
+        if 'how many' in query_lower:
+            variations.append(query_lower.replace('how many', 'count'))
         
-        for term, alternatives in common_terms.items():
-            if term in query_lower:
-                for alt in alternatives:
-                    expanded_query = query_lower.replace(term, alt)
-                    if expanded_query != query_lower:
-                        expanded.append(expanded_query)
-        
-        # Return unique expansions
-        return list(set(expanded))[:5]  # Limit to 5 expansions
+        # Return unique variations (limited to avoid too many queries)
+        return list(set(variations))[:3]
 
 
 class NLToSQLAgent:
@@ -264,20 +263,9 @@ class NLToSQLAgent:
                     relevant_docs = [doc for doc, meta, dist in top_pairs]
                     relevant_schema_parts = relevant_docs.copy()
                     
-                    # Also check metadata for synonyms match
-                    query_lower = user_query.lower()
-                    for doc, meta, dist in zip(documents, metadatas, distances):
-                        # Check if synonyms in metadata match query
-                        synonyms_str = meta.get('synonyms', '')
-                        if synonyms_str:
-                            synonyms = [s.strip().lower() for s in synonyms_str.split(',') if s.strip()]
-                            for synonym in synonyms:
-                                if synonym in query_lower or query_lower in synonym:
-                                    # Add this document if not already included
-                                    if doc not in relevant_docs:
-                                        relevant_docs.append(doc)
-                                        relevant_schema_parts.append(doc)
-                                        break
+                    # Use semantic distance-based filtering only
+                    # No hardcoded synonym matching - rely on embedding models
+                    # The embedding model's semantic understanding will handle synonyms
                 
                 # Combine relevant schema parts
                 if relevant_docs:
@@ -291,24 +279,31 @@ class NLToSQLAgent:
             schema_text = self._format_schema_for_llm(schema_details)
             relevant_schema_text = schema_text
         
-        prompt = f"""You are an expert SQL query generator. Convert the following natural language query into a valid {database_type.upper()} SQL query.
+        prompt = f"""You are an expert SQL query generator specializing in {database_type.upper()} databases. 
+Convert the following natural language query into a valid {database_type.upper()} SQL query.
 
 Database Type: {database_type.upper()}
 
-Relevant Schema Details (retrieved via semantic search based on your query):
+Relevant Schema Information (semantically matched from database):
 {relevant_schema_text}
 
 User Query: "{user_query}"
 
 Instructions:
-1. Generate a valid {database_type.upper()} SQL query
-2. Use only tables and columns that exist in the schema
-3. Include proper JOINs if multiple tables are needed
-4. Add appropriate WHERE clauses based on the query intent
-5. Use appropriate aggregate functions if needed (COUNT, SUM, AVG, MAX, MIN)
-6. Add GROUP BY if aggregations are used
-7. Add ORDER BY if results should be sorted
-8. Limit results to a reasonable number (use LIMIT or TOP)
+1. Carefully analyze the schema structure including table names, columns, data types, constraints, and relationships
+2. Generate a valid {database_type.upper()} SQL query that matches the query intent
+3. Use ONLY tables and columns that exist in the provided schema - verify names exactly
+4. Pay attention to foreign key relationships to properly JOIN related tables
+5. Include appropriate WHERE clauses based on the query intent
+6. Use aggregate functions (COUNT, SUM, AVG, MAX, MIN) when the query requires calculations
+7. Add GROUP BY when using aggregate functions with non-aggregated columns
+8. Add ORDER BY when the query should return sorted results
+9. Limit results appropriately using LIMIT (PostgreSQL, MySQL) or TOP (MSSQL) clauses
+10. Respect NOT NULL constraints and data types when constructing conditions
+11. Use proper JOIN syntax (INNER, LEFT, RIGHT) based on relationship requirements
+
+Important: The schema information above was retrieved using semantic search based on your query. 
+Use this context to understand the database structure and relationships.
 
 Respond in JSON format:
 {{

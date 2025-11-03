@@ -15,111 +15,150 @@ from config.embedding_models import AVAILABLE_EMBEDDINGS, get_default_embedding_
 
 def _create_enriched_schema_chunks(schema_data: dict, schema_text: str) -> List[dict]:
     """
-    Create enriched schema chunks with synonyms, aliases, and better descriptions
-    for improved semantic search (e.g., "movies" -> "film" table)
+    Create enriched schema chunks based purely on actual schema structure
+    No hardcoded mappings - relies on semantic understanding from embeddings
     """
     chunks = []
-    
-    # Common synonyms/aliases mapping
-    synonyms_map = {
-        'film': ['movie', 'movies', 'films', 'cinema', 'picture', 'pictures'],
-        'movie': ['film', 'movies', 'films', 'cinema', 'picture', 'pictures'],
-        'user': ['users', 'person', 'people', 'account', 'accounts'],
-        'customer': ['customers', 'client', 'clients', 'buyer', 'buyers'],
-        'order': ['orders', 'purchase', 'purchases', 'transaction', 'transactions'],
-        'product': ['products', 'item', 'items', 'goods', 'merchandise'],
-        'employee': ['employees', 'staff', 'worker', 'workers', 'personnel'],
-        'invoice': ['invoices', 'bill', 'bills', 'receipt', 'receipts'],
-        'address': ['addresses', 'location', 'locations', 'place', 'places'],
-        'payment': ['payments', 'transaction', 'transactions', 'fee', 'fees'],
-        'category': ['categories', 'type', 'types', 'class', 'classification'],
-        'review': ['reviews', 'rating', 'ratings', 'comment', 'comments'],
-        'cart': ['carts', 'basket', 'baskets', 'shopping cart'],
-        'wishlist': ['wishlists', 'favorites', 'favourites', 'saved items'],
-    }
     
     if schema_data and 'tables' in schema_data:
         tables = schema_data['tables']
         
+        # Create comprehensive table-level chunks with full context
         for table in tables:
-            table_name = table.get('name', '').lower()
+            table_name = table.get('name', '')
             
-            # Create chunks for each table with synonyms
-            table_info_parts = []
+            # Build comprehensive description using actual schema structure
+            description_parts = []
             
-            # Add table name with synonyms
-            synonyms = []
-            if table_name in synonyms_map:
-                synonyms = synonyms_map[table_name]
-            else:
-                # Try to find partial matches
-                for key, values in synonyms_map.items():
-                    if key in table_name or table_name in key:
-                        synonyms = values
-                        break
+            # Table header with full context
+            description_parts.append(f"Database Table: {table_name}")
             
-            # Build enriched description
-            description_parts = [f"Table: {table.get('name', 'unknown')}"]
+            # Schema context if available
+            schema_name = table.get('schema') or schema_data.get('schema_name')
+            if schema_name:
+                description_parts.append(f"Schema: {schema_name}")
             
-            if synonyms:
-                synonyms_str = ', '.join(synonyms)
-                description_parts.append(f"Also known as: {synonyms_str}")
-                description_parts.append(f"This table stores information about {table_name} (also referred to as {synonyms[0] if synonyms else table_name})")
-            
-            # Add columns with descriptions
+            # Detailed column information
             if table.get('columns'):
-                description_parts.append("Columns:")
+                description_parts.append("Table Columns:")
                 for col in table['columns']:
                     col_name = col.get('name', '')
-                    col_type = col.get('type', '')
-                    nullable = "optional" if col.get('nullable', True) else "required"
-                    description_parts.append(f"  - {col_name}: {col_type} ({nullable})")
+                    col_type = str(col.get('type', '')).lower()
+                    nullable = col.get('nullable', True)
+                    default = col.get('default')
+                    
+                    col_desc = f"  {col_name}: {col_type}"
+                    if not nullable:
+                        col_desc += " (NOT NULL)"
+                    if default:
+                        col_desc += f" DEFAULT {default}"
+                    description_parts.append(col_desc)
             
-            # Add primary keys
+            # Primary key constraints
             if table.get('primary_keys'):
-                pk_str = ', '.join(table['primary_keys'])
-                description_parts.append(f"Primary key: {pk_str}")
+                pk_columns = ', '.join(table['primary_keys'])
+                description_parts.append(f"Primary Key: {pk_columns}")
             
-            # Add foreign keys
+            # Foreign key relationships - very important for understanding table connections
             if table.get('foreign_keys'):
-                description_parts.append("Relationships:")
+                description_parts.append("Foreign Key Relationships:")
                 for fk in table['foreign_keys']:
                     fk_cols = ', '.join(fk.get('constrained_columns', []))
                     ref_table = fk.get('referred_table', '')
                     ref_cols = ', '.join(fk.get('referred_columns', []))
-                    description_parts.append(f"  - {fk_cols} -> {ref_table}.{ref_cols}")
+                    description_parts.append(f"  {fk_cols} references {ref_table}({ref_cols})")
             
-            # Create chunk for this table
+            # Indexes for query optimization hints
+            if table.get('indexes'):
+                description_parts.append("Indexes:")
+                for idx in table['indexes']:
+                    idx_cols = ', '.join(idx.get('columns', []))
+                    unique = "UNIQUE " if idx.get('unique') else ""
+                    description_parts.append(f"  {unique}Index: {idx_cols}")
+            
+            # Create comprehensive table chunk with rich context for embeddings
             table_chunk_text = '\n'.join(description_parts)
+            
+            # Add additional context that helps embedding models understand table purpose
+            # by analyzing column names and relationships semantically
+            column_names = [col.get('name', '') for col in table.get('columns', [])]
+            if column_names:
+                table_chunk_text += f"\nColumn Names: {', '.join(column_names)}"
+            
+            # Add relationship context
+            if table.get('foreign_keys'):
+                related_tables = set([fk.get('referred_table', '') for fk in table.get('foreign_keys', [])])
+                if related_tables:
+                    table_chunk_text += f"\nRelated Tables: {', '.join(sorted(related_tables))}"
+            
             chunks.append({
                 'text': table_chunk_text,
                 'metadata': {
-                    'table_name': table.get('name', ''),
+                    'table_name': table_name,
                     'chunk_type': 'table',
-                    'synonyms': ','.join(synonyms) if synonyms else ''
+                    'column_count': len(table.get('columns', [])),
+                    'has_foreign_keys': len(table.get('foreign_keys', [])) > 0
                 }
             })
             
-            # Also create individual column chunks for better granularity
+            # Create individual column chunks with full context for better granularity
             if table.get('columns'):
                 for col in table['columns']:
                     col_name = col.get('name', '')
-                    col_type = col.get('type', '')
+                    col_type = str(col.get('type', '')).lower()
                     
-                    col_chunk_text = f"""Column: {table.get('name')}.{col_name}
-Type: {col_type}
-Table: {table.get('name')}
+                    # Build column chunk with full table context
+                    col_chunk_text = f"""Column Definition:
+Table: {table_name}
+Column Name: {col_name}
+Data Type: {col_type}
 """
-                    if synonyms:
-                        col_chunk_text += f"Related terms: {', '.join(synonyms)}\n"
+                    if not col.get('nullable', True):
+                        col_chunk_text += "Constraint: NOT NULL\n"
+                    if col.get('default'):
+                        col_chunk_text += f"Default Value: {col.get('default')}\n"
+                    
+                    # Include relationship context if this column is part of a foreign key
+                    if table.get('foreign_keys'):
+                        for fk in table['foreign_keys']:
+                            if col_name in fk.get('constrained_columns', []):
+                                ref_table = fk.get('referred_table', '')
+                                col_chunk_text += f"Foreign Key: References {ref_table}\n"
+                    
+                    # Include primary key context
+                    if table.get('primary_keys') and col_name in table['primary_keys']:
+                        col_chunk_text += "Primary Key: Yes\n"
                     
                     chunks.append({
                         'text': col_chunk_text,
                         'metadata': {
-                            'table_name': table.get('name', ''),
+                            'table_name': table_name,
                             'column_name': col_name,
                             'chunk_type': 'column',
-                            'synonyms': ','.join(synonyms) if synonyms else ''
+                            'data_type': col_type
+                        }
+                    })
+            
+            # Create relationship chunks to help understand table connections
+            if table.get('foreign_keys'):
+                for fk in table['foreign_keys']:
+                    fk_cols = ', '.join(fk.get('constrained_columns', []))
+                    ref_table = fk.get('referred_table', '')
+                    ref_cols = ', '.join(fk.get('referred_columns', []))
+                    
+                    relationship_chunk = f"""Table Relationship:
+Source Table: {table_name}
+Source Columns: {fk_cols}
+References Table: {ref_table}
+Referenced Columns: {ref_cols}
+Relationship Type: Foreign Key Constraint
+"""
+                    chunks.append({
+                        'text': relationship_chunk,
+                        'metadata': {
+                            'table_name': table_name,
+                            'referenced_table': ref_table,
+                            'chunk_type': 'relationship'
                         }
                     })
     else:
@@ -1361,7 +1400,17 @@ async def process_database_schema(
         # Create or get session
         embedding_model_name = session_data.get("embedding_model_name")
         if not embedding_model_name:
+            # Use a better default for database schema - prefer BGE models for NL-to-SQL accuracy
+            default_models = ["BAAI/bge-large-en-v1.5", "BAAI/bge-base-en", "sentence-transformers/all-mpnet-base-v2"]
             embedding_model_name = get_default_embedding_model()
+            # Try to use a better model if available, otherwise fall back to default
+            try:
+                # Check if BGE models are available in the embedding models list
+                model_info = get_embedding_model_info("BAAI/bge-base-en")
+                if model_info:
+                    embedding_model_name = "BAAI/bge-base-en"  # Use BGE base as it's good balance
+            except:
+                pass  # Use default if better model not available
         
         session = ChatSession(
             user_id=user_id,
