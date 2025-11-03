@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import uvicorn
 import requests
 import json
@@ -10,13 +10,200 @@ import os
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider, EmbeddingModel
+from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider, EmbeddingModel, DatabaseConnection, DatabaseSchema
 from config.embedding_models import AVAILABLE_EMBEDDINGS, get_default_embedding_model, get_embedding_model_info, list_embedding_models
+
+def _create_enriched_schema_chunks(schema_data: dict, schema_text: str) -> List[dict]:
+    """
+    Create enriched schema chunks based purely on actual schema structure
+    No hardcoded mappings - relies on semantic understanding from embeddings
+    """
+    chunks = []
+    
+    if schema_data and 'tables' in schema_data:
+        tables = schema_data['tables']
+        
+        # Create comprehensive table-level chunks with full context
+        for table in tables:
+            table_name = table.get('name', '')
+            
+            # Build comprehensive description using actual schema structure
+            description_parts = []
+            
+            # Table header with full context
+            description_parts.append(f"Database Table: {table_name}")
+            
+            # Schema context if available
+            schema_name = table.get('schema') or schema_data.get('schema_name')
+            if schema_name:
+                description_parts.append(f"Schema: {schema_name}")
+            
+            # Detailed column information
+            if table.get('columns'):
+                description_parts.append("Table Columns:")
+                for col in table['columns']:
+                    col_name = col.get('name', '')
+                    col_type = str(col.get('type', '')).lower()
+                    nullable = col.get('nullable', True)
+                    default = col.get('default')
+                    
+                    col_desc = f"  {col_name}: {col_type}"
+                    if not nullable:
+                        col_desc += " (NOT NULL)"
+                    if default:
+                        col_desc += f" DEFAULT {default}"
+                    description_parts.append(col_desc)
+            
+            # Primary key constraints
+            if table.get('primary_keys'):
+                pk_columns = ', '.join(table['primary_keys'])
+                description_parts.append(f"Primary Key: {pk_columns}")
+            
+            # Foreign key relationships - very important for understanding table connections
+            if table.get('foreign_keys'):
+                description_parts.append("Foreign Key Relationships:")
+                for fk in table['foreign_keys']:
+                    fk_cols = ', '.join(fk.get('constrained_columns', []))
+                    ref_table = fk.get('referred_table', '')
+                    ref_cols = ', '.join(fk.get('referred_columns', []))
+                    description_parts.append(f"  {fk_cols} references {ref_table}({ref_cols})")
+            
+            # Indexes for query optimization hints
+            if table.get('indexes'):
+                description_parts.append("Indexes:")
+                for idx in table['indexes']:
+                    idx_cols = ', '.join(idx.get('columns', []))
+                    unique = "UNIQUE " if idx.get('unique') else ""
+                    description_parts.append(f"  {unique}Index: {idx_cols}")
+            
+            # Create comprehensive table chunk with rich context for embeddings
+            table_chunk_text = '\n'.join(description_parts)
+            
+            # Add additional context that helps embedding models understand table purpose
+            # by analyzing column names and relationships semantically
+            column_names = [col.get('name', '') for col in table.get('columns', [])]
+            if column_names:
+                table_chunk_text += f"\nColumn Names: {', '.join(column_names)}"
+            
+            # Add relationship context
+            if table.get('foreign_keys'):
+                related_tables = set([fk.get('referred_table', '') for fk in table.get('foreign_keys', [])])
+                if related_tables:
+                    table_chunk_text += f"\nRelated Tables: {', '.join(sorted(related_tables))}"
+            
+            chunks.append({
+                'text': table_chunk_text,
+                'metadata': {
+                    'table_name': table_name,
+                    'chunk_type': 'table',
+                    'column_count': len(table.get('columns', [])),
+                    'has_foreign_keys': len(table.get('foreign_keys', [])) > 0
+                }
+            })
+            
+            # Create individual column chunks with full context for better granularity
+            if table.get('columns'):
+                for col in table['columns']:
+                    col_name = col.get('name', '')
+                    col_type = str(col.get('type', '')).lower()
+                    
+                    # Build column chunk with full table context
+                    col_chunk_text = f"""Column Definition:
+Table: {table_name}
+Column Name: {col_name}
+Data Type: {col_type}
+"""
+                    if not col.get('nullable', True):
+                        col_chunk_text += "Constraint: NOT NULL\n"
+                    if col.get('default'):
+                        col_chunk_text += f"Default Value: {col.get('default')}\n"
+                    
+                    # Include relationship context if this column is part of a foreign key
+                    if table.get('foreign_keys'):
+                        for fk in table['foreign_keys']:
+                            if col_name in fk.get('constrained_columns', []):
+                                ref_table = fk.get('referred_table', '')
+                                col_chunk_text += f"Foreign Key: References {ref_table}\n"
+                    
+                    # Include primary key context
+                    if table.get('primary_keys') and col_name in table['primary_keys']:
+                        col_chunk_text += "Primary Key: Yes\n"
+                    
+                    chunks.append({
+                        'text': col_chunk_text,
+                        'metadata': {
+                            'table_name': table_name,
+                            'column_name': col_name,
+                            'chunk_type': 'column',
+                            'data_type': col_type
+                        }
+                    })
+            
+            # Create relationship chunks to help understand table connections
+            if table.get('foreign_keys'):
+                for fk in table['foreign_keys']:
+                    fk_cols = ', '.join(fk.get('constrained_columns', []))
+                    ref_table = fk.get('referred_table', '')
+                    ref_cols = ', '.join(fk.get('referred_columns', []))
+                    
+                    relationship_chunk = f"""Table Relationship:
+Source Table: {table_name}
+Source Columns: {fk_cols}
+References Table: {ref_table}
+Referenced Columns: {ref_cols}
+Relationship Type: Foreign Key Constraint
+"""
+                    chunks.append({
+                        'text': relationship_chunk,
+                        'metadata': {
+                            'table_name': table_name,
+                            'referenced_table': ref_table,
+                            'chunk_type': 'relationship'
+                        }
+                    })
+    else:
+        # Fallback to text-based chunking if schema_data is not available
+        chunk_size = 1000
+        overlap = 200
+        lines = schema_text.split('\n')
+        current_chunk = []
+        current_length = 0
+        
+        for line in lines:
+            line_length = len(line)
+            if current_length + line_length > chunk_size and current_chunk:
+                chunks.append({
+                    'text': '\n'.join(current_chunk),
+                    'metadata': {
+                        'chunk_type': 'text',
+                        'chunk_index': len(chunks)
+                    }
+                })
+                overlap_lines = current_chunk[-3:] if len(current_chunk) >= 3 else current_chunk
+                current_chunk = overlap_lines + [line]
+                current_length = sum(len(l) for l in current_chunk)
+            else:
+                current_chunk.append(line)
+                current_length += line_length
+        
+        if current_chunk:
+            chunks.append({
+                'text': '\n'.join(current_chunk),
+                'metadata': {
+                    'chunk_type': 'text',
+                    'chunk_index': len(chunks)
+                }
+            })
+    
+    return chunks
 from services.pdf_processor import PDFProcessor
 from services.embedding_service import EmbeddingService
 from services.chromadb_service import ChromaDBService
 from services.rag_service import RAGService
 from services.llm_service import LLMService
+from services.database_schema_service import DatabaseSchemaService
+from services.db_agents import DatabaseAgentSystem
+from services.sql_execution_service import SQLExecutionService
 from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
 
@@ -41,6 +228,8 @@ embedding_service = EmbeddingService()
 chromadb_service = ChromaDBService()
 rag_service = RAGService()
 llm_service = LLMService()
+database_schema_service = DatabaseSchemaService()
+sql_execution_service = SQLExecutionService()
 
 # Verify embedding models configuration on startup
 try:
@@ -911,6 +1100,736 @@ async def get_session_messages(
         }
         for m in messages
     ]
+
+# Database Schema Chat Endpoints
+@app.post("/api/database/connections")
+async def create_database_connection(
+    connection_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Create a new database connection"""
+    try:
+        connection = DatabaseConnection(
+            user_id=connection_data.get("user_id", 1),
+            name=connection_data.get("name"),
+            database_type=connection_data.get("database_type"),
+            host=connection_data.get("host"),
+            port=connection_data.get("port"),
+            database_name=connection_data.get("database_name"),
+            username=connection_data.get("username"),
+            password=connection_data.get("password"),
+            connection_string=connection_data.get("connection_string"),
+            schema_name=connection_data.get("schema_name"),
+            is_active=connection_data.get("is_active", 1)
+        )
+        db.add(connection)
+        db.commit()
+        db.refresh(connection)
+        return {
+            "success": True,
+            "connection": {
+                "id": connection.id,
+                "name": connection.name,
+                "database_type": connection.database_type,
+                "database_name": connection.database_name,
+                "created_at": connection.created_at.isoformat()
+            }
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create connection: {str(e)}")
+
+@app.get("/api/database/connections")
+async def get_database_connections(
+    user_id: int = 1,
+    db: Session = Depends(get_db)
+):
+    """Get all database connections for a user"""
+    connections = db.query(DatabaseConnection).filter(
+        DatabaseConnection.user_id == user_id,
+        DatabaseConnection.is_active == 1
+    ).all()
+    
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "database_type": c.database_type,
+            "host": c.host,
+            "port": c.port,
+            "database_name": c.database_name,
+            "username": c.username,
+            "schema_name": c.schema_name,
+            "created_at": c.created_at.isoformat(),
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None
+        }
+        for c in connections
+    ]
+
+@app.get("/api/database/connections/{connection_id}")
+async def get_database_connection(
+    connection_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get a single database connection"""
+    connection = db.query(DatabaseConnection).filter(
+        DatabaseConnection.id == connection_id
+    ).first()
+    
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    return {
+        "id": connection.id,
+        "name": connection.name,
+        "database_type": connection.database_type,
+        "host": connection.host,
+        "port": connection.port,
+        "database_name": connection.database_name,
+        "username": connection.username,
+        "schema_name": connection.schema_name,
+        "created_at": connection.created_at.isoformat(),
+        "updated_at": connection.updated_at.isoformat() if connection.updated_at else None
+    }
+
+@app.put("/api/database/connections/{connection_id}")
+async def update_database_connection(
+    connection_id: int,
+    connection_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Update a database connection"""
+    connection = db.query(DatabaseConnection).filter(
+        DatabaseConnection.id == connection_id
+    ).first()
+    
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    try:
+        for key, value in connection_data.items():
+            if hasattr(connection, key):
+                setattr(connection, key, value)
+        
+        db.commit()
+        db.refresh(connection)
+        
+        return {
+            "success": True,
+            "connection": {
+                "id": connection.id,
+                "name": connection.name,
+                "database_type": connection.database_type,
+                "updated_at": connection.updated_at.isoformat() if connection.updated_at else None
+            }
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update connection: {str(e)}")
+
+@app.delete("/api/database/connections/{connection_id}")
+async def delete_database_connection(
+    connection_id: int,
+    db: Session = Depends(get_db)
+):
+    """Delete a database connection"""
+    connection = db.query(DatabaseConnection).filter(
+        DatabaseConnection.id == connection_id
+    ).first()
+    
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    try:
+        # Soft delete by setting is_active to 0
+        connection.is_active = 0
+        db.commit()
+        return {"success": True, "message": "Connection deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete connection: {str(e)}")
+
+@app.post("/api/database/test-connection")
+async def test_database_connection(connection_data: dict):
+    """Test database connection"""
+    try:
+        result = database_schema_service.test_connection(
+            database_type=connection_data.get("database_type"),
+            connection_string=connection_data.get("connection_string"),
+            host=connection_data.get("host"),
+            port=connection_data.get("port"),
+            database_name=connection_data.get("database_name"),
+            username=connection_data.get("username"),
+            password=connection_data.get("password")
+        )
+        return result
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Connection test failed: {str(e)}"
+        }
+
+@app.post("/api/database/extract-schema")
+async def extract_database_schema(
+    connection_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Extract schema from database"""
+    try:
+        connection_id = connection_data.get("connection_id")
+        
+        # If connection_id is provided, get connection from database
+        if connection_id:
+            connection = db.query(DatabaseConnection).filter(
+                DatabaseConnection.id == connection_id
+            ).first()
+            if not connection:
+                raise HTTPException(status_code=404, detail="Connection not found")
+            
+            # Use connection data from database
+            extract_result = database_schema_service.extract_schema(
+                database_type=connection.database_type,
+                connection_string=connection.connection_string,
+                host=connection.host,
+                port=connection.port,
+                database_name=connection.database_name,
+                username=connection.username,
+                password=connection.password,
+                schema_name=connection.schema_name
+            )
+        else:
+            # Use provided connection data directly
+            extract_result = database_schema_service.extract_schema(
+                database_type=connection_data.get("database_type"),
+                connection_string=connection_data.get("connection_string"),
+                host=connection_data.get("host"),
+                port=connection_data.get("port"),
+                database_name=connection_data.get("database_name"),
+                username=connection_data.get("username"),
+                password=connection_data.get("password"),
+                schema_name=connection_data.get("schema_name")
+            )
+        
+        if not extract_result.get("success"):
+            raise HTTPException(status_code=500, detail=extract_result.get("error", "Failed to extract schema"))
+        
+        return {
+            "success": True,
+            "schema_data": extract_result.get("schema_data"),
+            "schema_text": extract_result.get("schema_text"),
+            "metadata": extract_result.get("metadata")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to extract schema: {str(e)}")
+
+@app.post("/api/database/save-schema")
+async def save_database_schema(
+    schema_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Save extracted schema to database"""
+    try:
+        connection_id = schema_data.get("connection_id")
+        schema_info = schema_data.get("schema_data")
+        schema_text = schema_data.get("schema_text")
+        
+        if not connection_id or not schema_info:
+            raise HTTPException(status_code=400, detail="connection_id and schema_data are required")
+        
+        # Check if schema already exists for this connection
+        existing_schema = db.query(DatabaseSchema).filter(
+            DatabaseSchema.connection_id == connection_id
+        ).first()
+        
+        if existing_schema:
+            # Update existing schema
+            existing_schema.schema_data = schema_info
+            existing_schema.schema_text = schema_text
+            existing_schema.is_processed = 0  # Reset processed flag if schema changed
+            db.commit()
+            db.refresh(existing_schema)
+            schema_id = existing_schema.id
+        else:
+            # Create new schema
+            new_schema = DatabaseSchema(
+                connection_id=connection_id,
+                schema_data=schema_info,
+                schema_text=schema_text,
+                is_processed=0
+            )
+            db.add(new_schema)
+            db.commit()
+            db.refresh(new_schema)
+            schema_id = new_schema.id
+        
+        return {
+            "success": True,
+            "schema_id": schema_id,
+            "message": "Schema saved successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to save schema: {str(e)}")
+
+@app.post("/api/database/process-schema")
+async def process_database_schema(
+    session_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Process schema and create ChromaDB collection"""
+    try:
+        connection_id = session_data.get("connection_id")
+        user_id = session_data.get("user_id", 1)
+        session_name = session_data.get("session_name", "New Session")
+        
+        if not connection_id:
+            raise HTTPException(status_code=400, detail="connection_id is required")
+        
+        # Get schema from database
+        schema = db.query(DatabaseSchema).filter(
+            DatabaseSchema.connection_id == connection_id
+        ).first()
+        
+        if not schema:
+            raise HTTPException(status_code=404, detail="Schema not found. Please extract schema first.")
+        
+        # Create or get session
+        embedding_model_name = session_data.get("embedding_model_name")
+        if not embedding_model_name:
+            # Use a better default for database schema - prefer BGE models for NL-to-SQL accuracy
+            default_models = ["BAAI/bge-large-en-v1.5", "BAAI/bge-base-en", "sentence-transformers/all-mpnet-base-v2"]
+            embedding_model_name = get_default_embedding_model()
+            # Try to use a better model if available, otherwise fall back to default
+            try:
+                # Check if BGE models are available in the embedding models list
+                model_info = get_embedding_model_info("BAAI/bge-base-en")
+                if model_info:
+                    embedding_model_name = "BAAI/bge-base-en"  # Use BGE base as it's good balance
+            except:
+                pass  # Use default if better model not available
+        
+        session = ChatSession(
+            user_id=user_id,
+            session_name=session_name,
+            llm_model_id=session_data.get("llm_model_id", 1),
+            embedding_model_id=None,
+            created_at=datetime.utcnow()
+        )
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        
+        # Collection name based on session ID
+        collection_name = f"db_session_{session.id}"
+        
+        # Prepare schema data and text
+        schema_data = schema.schema_data or {}
+        schema_text = schema.schema_text or ""
+        
+        # Create enriched schema chunks with synonyms and better descriptions
+        chunks = _create_enriched_schema_chunks(schema_data, schema_text)
+        
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No schema content to vectorize")
+        
+        # Generate embeddings
+        all_texts = [chunk['text'] for chunk in chunks]
+        embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+        
+        # Prepare metadata and IDs
+        all_metadatas = []
+        all_ids = []
+        for i, chunk in enumerate(chunks):
+            metadata = chunk['metadata'].copy()
+            metadata['session_id'] = str(session.id)
+            metadata['connection_id'] = str(connection_id)
+            metadata['chunk_index'] = i
+            all_metadatas.append(metadata)
+            all_ids.append(f"schema_{connection_id}_{chunk['metadata'].get('chunk_type', 'text')}_{i}")
+        
+        # Add to ChromaDB
+        chromadb_service.add_documents(
+            collection_name=collection_name,
+            texts=all_texts,
+            embeddings=embeddings,
+            metadatas=all_metadatas,
+            ids=all_ids
+        )
+        
+        # Update schema to mark as processed
+        schema.is_processed = 1
+        schema.session_id = session.id
+        db.commit()
+        
+        # Build preview
+        preview_text = schema_text[:2000] if schema_text else "Schema processed successfully"
+        
+        return {
+            "success": True,
+            "session_id": session.id,
+            "collection_name": collection_name,
+            "total_chunks": len(chunks),
+            "message": "Schema processed and vectorized successfully",
+            "used_embedding_model": embedding_model_name,
+            "preview": {
+                "summary": preview_text
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process schema: {str(e)}")
+
+@app.post("/api/database/chat")
+async def database_chat(
+    chat_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Chat with database using agent system"""
+    try:
+        session_id = chat_data.get("session_id")
+        message = chat_data.get("message")
+        model_id = chat_data.get("model_id")
+        user_id = chat_data.get("user_id", 1)
+        
+        if not session_id or not message:
+            raise HTTPException(status_code=400, detail="session_id and message are required")
+        
+        # Get session
+        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get model config
+        model = db.query(LLMModel).filter(LLMModel.id == model_id).first()
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found")
+        
+        model_config = {
+            "provider": model.provider.value,
+            "model_name": model.model_name,
+            "base_url": model.base_url,
+            "api_key": model.api_key if hasattr(model, 'api_key') else None
+        }
+        
+        # Get database connection and schema
+        schema = db.query(DatabaseSchema).filter(DatabaseSchema.session_id == session_id).first()
+        if not schema:
+            raise HTTPException(status_code=404, detail="Schema not found for this session")
+        
+        connection = db.query(DatabaseConnection).filter(
+            DatabaseConnection.id == schema.connection_id
+        ).first()
+        if not connection:
+            raise HTTPException(status_code=404, detail="Database connection not found")
+        
+        # Create agent system with model config and services for semantic search
+        agent_llm_service = LLMService()
+        # Create agent system with model config and embedding/chromadb services
+        db_agent_system = DatabaseAgentSystem(
+            agent_llm_service, 
+            database_schema_service,
+            embedding_service=embedding_service,
+            chromadb_service=chromadb_service,
+            model_config=model_config
+        )
+        
+        # Get chat history for context
+        previous_messages = db.query(ChatMessageModel).filter(
+            ChatMessageModel.session_id == session_id
+        ).order_by(ChatMessageModel.created_at).limit(10).all()
+        
+        previous_context = [
+            {"role": msg.role, "content": msg.message} 
+            for msg in previous_messages
+        ] if previous_messages else None
+        
+        # Collection name for semantic search
+        collection_name = f"db_session_{session_id}"
+        
+        # Get embedding model name (use default if not specified)
+        embedding_model_name = get_default_embedding_model()
+        
+        # Process query through agent system with semantic search
+        agent_result = db_agent_system.process_query(
+            user_query=message,
+            schema_details=schema.schema_data,
+            schema_text=schema.schema_text or "",
+            database_type=connection.database_type,
+            collection_name=collection_name,  # For semantic search
+            embedding_model_name=embedding_model_name,  # For semantic search
+            connection_string=connection.connection_string,
+            host=connection.host,
+            port=connection.port,
+            database_name=connection.database_name,
+            username=connection.username,
+            password=connection.password
+        )
+        
+        # Prepare response
+        response_text = ""
+        sql_executed = False
+        query_result = None
+        relevant_schema_parts = agent_result.get('relevant_schema_parts', [])
+        metadata = {
+            "intent": agent_result.get('intent', {}),
+            "requires_sql": agent_result.get('requires_sql', False),
+            "sql": agent_result.get('sql'),
+            "sql_validation": agent_result.get('sql_validation', {}),
+            "relevant_schema_parts_count": len(relevant_schema_parts),
+            "used_semantic_search": len(relevant_schema_parts) > 0
+        }
+        
+        # If SQL should be executed
+        if agent_result.get('should_execute') and agent_result.get('sql'):
+            # Execute SQL
+            sql_result = sql_execution_service.execute_query(
+                sql=agent_result['sql'],
+                database_type=connection.database_type,
+                connection_string=connection.connection_string,
+                host=connection.host,
+                port=connection.port,
+                database_name=connection.database_name,
+                username=connection.username,
+                password=connection.password
+            )
+            
+            sql_executed = True
+            query_result = sql_result
+            
+            if sql_result.get('success'):
+                # Format SQL results into natural language response
+                try:
+                    query_data = sql_result.get('data', [])
+                    row_count = sql_result.get('row_count', 0)
+                    
+                    # Only include query results in context if they're not too large
+                    if row_count > 0 and len(query_data) <= 100:  # Limit to 100 rows for context
+                        results_summary = json.dumps(query_data, indent=2, default=str)
+                        context_message = f"SQL Query executed successfully and returned {row_count} rows.\n\nQuery Results:\n{results_summary[:2000]}"  # Limit context size
+                    else:
+                        context_message = f"SQL Query executed successfully and returned {row_count} rows."
+                    
+                    response_text = db_agent_system._generate_chat_response(
+                        user_query=message,
+                        schema_details=schema.schema_data,
+                        schema_text=schema.schema_text or "",
+                        previous_context=previous_context + [
+                            {"role": "assistant", "content": context_message}
+                        ] if previous_context else [
+                            {"role": "assistant", "content": context_message}
+                        ]
+                    )
+                    
+                    # Only include successful query results in metadata
+                    if row_count > 0:
+                        metadata['query_result'] = {
+                            'row_count': row_count,
+                            'columns': sql_result.get('columns', []),
+                            'sample_data': query_data[:10] if len(query_data) <= 100 else []  # First 10 rows, only if not too large
+                        }
+                    else:
+                        metadata['query_result'] = {
+                            'row_count': 0,
+                            'columns': sql_result.get('columns', []),
+                            'message': 'Query executed successfully but returned no rows.'
+                        }
+                except Exception as e:
+                    # If formatting fails, provide a simple response
+                    import logging
+                    logging.error(f"Error formatting SQL results: {str(e)}")
+                    row_count = sql_result.get('row_count', 0)
+                    if row_count > 0:
+                        response_text = f"I successfully executed your query and found {row_count} result(s)."
+                    else:
+                        response_text = "I executed your query successfully, but it returned no results."
+            else:
+                # SQL execution failed - provide user-friendly error message
+                error_msg = sql_result.get('error', 'Unknown error occurred')
+                error_type = sql_result.get('error_type', 'execution_error')
+                
+                # Don't expose raw SQL errors to frontend
+                # Generate a helpful response instead
+                if 'table' in error_msg.lower() or 'column' in error_msg.lower():
+                    response_text = "I couldn't execute the query because some tables or columns referenced don't exist in the database. Could you rephrase your question or be more specific about what you're looking for?"
+                elif 'syntax' in error_msg.lower() or 'invalid' in error_msg.lower():
+                    response_text = "There was an issue with the generated SQL query. Let me try to understand your question better - could you rephrase it?"
+                elif 'permission' in error_msg.lower() or 'access' in error_msg.lower():
+                    response_text = "I don't have permission to execute this type of query on the database. Please check your database connection permissions."
+                elif 'connection' in error_msg.lower():
+                    response_text = "I couldn't connect to the database to execute the query. Please check your database connection settings."
+                else:
+                    # Generic user-friendly error message
+                    response_text = "I encountered an issue executing the query. Could you try rephrasing your question or provide more specific details about what you need?"
+                
+                # Store error info in metadata (for debugging, but not exposed to user)
+                metadata['query_error'] = {
+                    'type': error_type,
+                    'message': error_msg  # For backend logging only
+                }
+                metadata['sql'] = None  # Don't expose SQL if it failed
+        
+        elif agent_result.get('chat_response'):
+            # Use chat response from agent
+            response_text = agent_result['chat_response']
+        else:
+            # Fallback: Use RAG with schema context
+            try:
+                collections = chromadb_service.list_collections()
+                if collection_name in collections:
+                    rag_result = rag_service.query(
+                        query_text=message,
+                        collection_name=collection_name,
+                        model_config=model_config,
+                        embedding_model_name=embedding_model_name,
+                        n_results=5
+                    )
+                    response_text = rag_result["response"]
+                    metadata['sources'] = rag_result.get("sources", [])
+                else:
+                    response_text = "I couldn't process your query. Please try rephrasing it or make sure the schema has been processed first."
+            except Exception as e:
+                import logging
+                logging.error(f"RAG query error: {str(e)}")
+                response_text = "I'm having trouble processing your query right now. Could you try rephrasing it or check if the database schema has been processed?"
+        
+        # Save user message
+        user_message = ChatMessageModel(
+            session_id=session_id,
+            role="user",
+            message=message,
+            created_at=datetime.utcnow()
+        )
+        db.add(user_message)
+        
+        # Save assistant message with metadata
+        assistant_message = ChatMessageModel(
+            session_id=session_id,
+            role="assistant",
+            message=response_text,
+            meta_data=metadata,
+            created_at=datetime.utcnow()
+        )
+        db.add(assistant_message)
+        db.commit()
+        
+        # Vectorize chat history (add new messages to collection)
+        collection_name = f"db_session_{session_id}"
+        try:
+            # Get all messages for this session
+            all_messages = db.query(ChatMessageModel).filter(
+                ChatMessageModel.session_id == session_id
+            ).order_by(ChatMessageModel.created_at).all()
+            
+            # Prepare texts for vectorization (last N messages)
+            recent_messages = all_messages[-10:]  # Last 10 messages
+            chat_texts = []
+            chat_metadatas = []
+            chat_ids = []
+            
+            for msg in recent_messages:
+                text = f"{msg.role}: {msg.message}"
+                chat_texts.append(text)
+                chat_metadatas.append({
+                    "session_id": str(session_id),
+                    "message_id": str(msg.id),
+                    "role": msg.role,
+                    "timestamp": msg.created_at.isoformat()
+                })
+                chat_ids.append(f"msg_{msg.id}")
+            
+            if chat_texts:
+                # Generate embeddings
+                embeddings = embedding_service.generate_embeddings(
+                    chat_texts, 
+                    model_name=get_default_embedding_model()
+                )
+                
+                # Add to ChromaDB (update collection)
+                try:
+                    # Get existing collection or create
+                    collections = chromadb_service.list_collections()
+                    if collection_name not in collections:
+                        # Create collection if doesn't exist
+                        chromadb_service.create_collection(collection_name)
+                    
+                    # Add messages
+                    chromadb_service.add_documents(
+                        collection_name=collection_name,
+                        texts=chat_texts,
+                        embeddings=embeddings,
+                        metadatas=chat_metadatas,
+                        ids=chat_ids
+                    )
+                except Exception as e:
+                    print(f"[Chat] Error vectorizing chat history: {str(e)}")
+        except Exception as e:
+            print(f"[Chat] Error in vectorization process: {str(e)}")
+        
+        # Prepare response - only include SQL if execution was successful
+        response_data = {
+            "response": response_text,
+            "message_id": assistant_message.id,
+            "session_id": session_id,
+            "requires_sql": agent_result.get('requires_sql', False),
+            "sql_executed": sql_executed,
+            "metadata": {
+                "intent": metadata.get('intent', {}),
+                "used_semantic_search": metadata.get('used_semantic_search', False),
+                "relevant_schema_parts_count": metadata.get('relevant_schema_parts_count', 0)
+            }
+        }
+        
+        # Only include SQL in response if execution was successful
+        if sql_executed and query_result and query_result.get('success'):
+            response_data["sql"] = agent_result.get('sql')
+            if query_result.get('data'):
+                response_data["query_result"] = query_result.get('data', [])[:10]  # Limit to 10 rows
+            else:
+                response_data["query_result"] = []
+        elif agent_result.get('sql') and not sql_executed:
+            # SQL was generated but not executed (validation failed)
+            # Don't expose the SQL to frontend
+            response_data["sql"] = None
+        else:
+            # No SQL generated or errors occurred
+            response_data["sql"] = None
+        
+        return response_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+@app.get("/api/database/schemas/{connection_id}")
+async def get_database_schema(
+    connection_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get saved schema for a connection"""
+    schema = db.query(DatabaseSchema).filter(
+        DatabaseSchema.connection_id == connection_id
+    ).first()
+    
+    if not schema:
+        raise HTTPException(status_code=404, detail="Schema not found")
+    
+    return {
+        "id": schema.id,
+        "connection_id": schema.connection_id,
+        "session_id": schema.session_id,
+        "schema_data": schema.schema_data,
+        "schema_text": schema.schema_text,
+        "is_processed": schema.is_processed,
+        "created_at": schema.created_at.isoformat(),
+        "updated_at": schema.updated_at.isoformat() if schema.updated_at else None
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

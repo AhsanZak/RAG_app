@@ -169,4 +169,84 @@ export const pdfChatAPI = {
   },
 };
 
+// Database Chat API
+export const databaseChatAPI = {
+  // Create database connection
+  createConnection: async (connectionData) => {
+    const response = await api.post('/api/database/connections', connectionData);
+    return response.data;
+  },
+
+  // Get all connections
+  getConnections: async (userId = 1) => {
+    const response = await api.get(`/api/database/connections?user_id=${userId}`);
+    return response.data;
+  },
+
+  // Get single connection
+  getConnection: async (connectionId) => {
+    const response = await api.get(`/api/database/connections/${connectionId}`);
+    return response.data;
+  },
+
+  // Update connection
+  updateConnection: async (connectionId, connectionData) => {
+    const response = await api.put(`/api/database/connections/${connectionId}`, connectionData);
+    return response.data;
+  },
+
+  // Delete connection
+  deleteConnection: async (connectionId) => {
+    const response = await api.delete(`/api/database/connections/${connectionId}`);
+    return response.data;
+  },
+
+  // Test connection
+  testConnection: async (connectionData) => {
+    const response = await api.post('/api/database/test-connection', connectionData);
+    return response.data;
+  },
+
+  // Extract schema
+  extractSchema: async (connectionData) => {
+    const response = await api.post('/api/database/extract-schema', connectionData);
+    return response.data;
+  },
+
+  // Save schema
+  saveSchema: async (schemaData) => {
+    const response = await api.post('/api/database/save-schema', schemaData);
+    return response.data;
+  },
+
+  // Process schema (create embeddings)
+  processSchema: async (sessionData) => {
+    const response = await api.post('/api/database/process-schema', sessionData);
+    return response.data;
+  },
+
+  // Chat with database schema
+  chat: async (sessionId, message, modelId) => {
+    const response = await api.post('/api/database/chat', {
+      session_id: sessionId,
+      message: message,
+      model_id: modelId,
+      user_id: 1
+    });
+    return response.data;
+  },
+
+  // Get saved schema for connection
+  getSchema: async (connectionId) => {
+    const response = await api.get(`/api/database/schemas/${connectionId}`);
+    return response.data;
+  },
+
+  // Get session messages (reuse from pdfChatAPI)
+  getSessionMessages: async (sessionId) => {
+    const response = await api.get(`/api/sessions/${sessionId}/messages`);
+    return response.data;
+  },
+};
+
 export default api;

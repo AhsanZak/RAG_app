@@ -23,10 +23,11 @@ AVAILABLE_EMBEDDINGS = {
     "sentence-transformers/all-mpnet-base-v2": {
         "provider": "sentence-transformers",
         "languages": ["en"],
-        "description": "Higher quality English embedding model",
+        "description": "Higher quality English embedding model - Good for schema understanding",
         "dimension": 768,
-        "display_name": "MPNet Base v2 (English)",
-        "is_default": False
+        "display_name": "MPNet Base v2 (Schema Understanding)",
+        "is_default": False,
+        "recommended_for": ["database_schema"]
     },
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2": {
         "provider": "sentence-transformers",
@@ -71,18 +72,20 @@ AVAILABLE_EMBEDDINGS = {
     "BAAI/bge-base-en": {
         "provider": "huggingface",
         "languages": ["en"],
-        "description": "Base English BGE model",
+        "description": "Base English BGE model - Good balance for NL-to-SQL",
         "dimension": 768,
-        "display_name": "BGE Base EN",
-        "is_default": False
+        "display_name": "BGE Base EN (SQL Ready)",
+        "is_default": False,
+        "recommended_for": ["nl_to_sql"]
     },
     "BAAI/bge-large-en-v1.5": {
         "provider": "huggingface",
         "languages": ["en"],
-        "description": "High-accuracy English embeddings v1.5",
+        "description": "High-accuracy English embeddings v1.5 - Recommended for NL-to-SQL",
         "dimension": 1024,
-        "display_name": "BGE Large EN v1.5",
-        "is_default": False
+        "display_name": "BGE Large EN v1.5 (Best for SQL)",
+        "is_default": False,
+        "recommended_for": ["nl_to_sql", "database_schema"]
     },
     "BAAI/bge-m3": {
         "provider": "huggingface",

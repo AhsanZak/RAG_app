@@ -13,6 +13,7 @@ import LLMModelManagement from './components/LLMModelManagement';
 import ChatInterface from './components/ChatInterface';
 import ChatTypeSelector from './components/ChatTypeSelector';
 import PDFChat from './components/PDFChat';
+import DatabaseChat from './components/DatabaseChat';
 
 const { Header, Content, Footer, Sider } = Layout;
 const { Title, Paragraph } = Typography;
@@ -67,7 +68,10 @@ function App() {
         if (selectedChatType === 'pdf') {
           return <PDFChat onBack={handleBackToChatTypes} />;
         }
-        // TODO: Add other chat types (excel, text, word, database, general)
+        if (selectedChatType === 'database') {
+          return <DatabaseChat onBack={handleBackToChatTypes} />;
+        }
+        // TODO: Add other chat types (excel, text, word, general)
         return <ChatTypeSelector onSelectChatType={handleSelectChatType} />;
       case 'chat':
         return <ChatInterface />;

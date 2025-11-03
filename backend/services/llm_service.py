@@ -83,45 +83,76 @@ class LLMService:
     
     def generate_response(
         self,
-        prompt: str,
-        model_config: Dict,
-        context: Optional[str] = None
+        messages: List[Dict[str, str]],
+        model_config: Optional[Dict] = None,
+        temperature: float = 0.7
     ) -> str:
         """
-        Generate response using configured LLM
+        Generate response using configured LLM with messages
         
         Args:
-            prompt: User prompt/question
-            model_config: Model configuration dict with provider, model_name, base_url, etc.
-            context: Optional context/retrieved documents
+            messages: List of message dicts with 'role' and 'content'
+            model_config: Optional model configuration dict (for backward compatibility)
+            temperature: Temperature for generation
             
         Returns:
             Generated response text
         """
-        provider = model_config.get('provider')
-        model_name = model_config.get('model_name')
-        base_url = model_config.get('base_url')
-        
-        # Build prompt with context if provided
-        if context:
-            system_prompt = f"""You are a helpful AI assistant. Use the following context to answer the user's question. 
-If the context doesn't contain relevant information, say so.
-
-Context:
-{context}
-
-User Question: {prompt}
-
-Answer:"""
+        # Check if messages is a string (backward compatibility)
+        if isinstance(messages, str):
+            prompt = messages
+            model_name = model_config.get('model_name') if model_config else None
+            base_url = model_config.get('base_url') if model_config else None
+            provider = model_config.get('provider') if model_config else 'ollama'
+            
+            messages = [{"role": "user", "content": prompt}]
         else:
-            system_prompt = prompt
+            # Extract model config from first message or use default
+            provider = 'ollama'
+            model_name = None
+            base_url = None
+            
+            if model_config:
+                provider = model_config.get('provider', 'ollama')
+                model_name = model_config.get('model_name')
+                base_url = model_config.get('base_url')
         
         if provider == 'ollama':
-            messages = [
-                {"role": "user", "content": system_prompt}
-            ]
+            # Use default if not provided
+            if not model_name:
+                model_name = "llama2"  # Default Ollama model
+            if not base_url:
+                base_url = self.ollama_base_url
+            
             result = self.chat_with_ollama(model_name, messages, base_url)
             return result.get('content', '')
+        elif provider == 'openai':
+            # Add OpenAI support
+            import os
+            api_key = model_config.get('api_key') if model_config else os.getenv('OPENAI_API_KEY')
+            base_url = model_config.get('base_url') if model_config else 'https://api.openai.com/v1'
+            model_name = model_config.get('model_name') if model_config else 'gpt-3.5-turbo'
+            
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": temperature
+            }
+            
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=120
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result['choices'][0]['message']['content']
         else:
             raise NotImplementedError(f"Provider '{provider}' not yet implemented")
 
