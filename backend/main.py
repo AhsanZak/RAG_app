@@ -1045,10 +1045,26 @@ async def pdf_chat(
 @app.get("/api/sessions")
 async def get_sessions(
     user_id: int = 1,
+    connection_id: int = None,  # Optional filter for database sessions
     db: Session = Depends(get_db)
 ):
-    """Get all sessions for a user"""
-    sessions = db.query(ChatSession).filter(ChatSession.user_id == user_id).all()
+    """Get all sessions for a user (PDF and Database sessions)"""
+    query = db.query(ChatSession).filter(ChatSession.user_id == user_id)
+    
+    # If connection_id is provided, filter for database sessions only
+    if connection_id:
+        # Get sessions that have DatabaseSchema linked to this connection
+        schemas = db.query(DatabaseSchema).filter(
+            DatabaseSchema.connection_id == connection_id
+        ).all()
+        session_ids = [s.session_id for s in schemas if s.session_id]
+        if session_ids:
+            query = query.filter(ChatSession.id.in_(session_ids))
+        else:
+            # No sessions for this connection yet
+            return []
+    
+    sessions = query.all()
     
     # Get list of existing collections
     try:
@@ -1058,7 +1074,18 @@ async def get_sessions(
     
     result = []
     for s in sessions:
-        collection_name = f"session_{s.id}"
+        # Check if this is a database session (has DatabaseSchema) or PDF session
+        schema = db.query(DatabaseSchema).filter(DatabaseSchema.session_id == s.id).first()
+        
+        if schema:
+            # Database session - use db_session_ prefix
+            collection_name = f"db_session_{s.id}"
+            session_type = "database"
+        else:
+            # PDF session - use session_ prefix
+            collection_name = f"session_{s.id}"
+            session_type = "pdf"
+        
         has_vectorized_data = collection_name in existing_collections
         
         result.append({
@@ -1070,6 +1097,8 @@ async def get_sessions(
             "embedding_model_id": s.embedding_model_id,
             "hasVectorizedData": has_vectorized_data,
             "collection_name": collection_name,
+            "session_type": session_type,
+            "connection_id": schema.connection_id if schema else None,
             "embedding_model": {
                 "id": s.embedding_model.id,
                 "model_name": s.embedding_model.model_name,
