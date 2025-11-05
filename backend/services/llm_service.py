@@ -127,9 +127,12 @@ class LLMService:
             result = self.chat_with_ollama(model_name, messages, base_url)
             return result.get('content', '')
         elif provider == 'openai':
-            # Add OpenAI support
+            # OpenAI API support
             import os
             api_key = model_config.get('api_key') if model_config else os.getenv('OPENAI_API_KEY')
+            if not api_key:
+                raise ValueError("OpenAI API key is required. Set it in model_config or OPENAI_API_KEY environment variable.")
+            
             base_url = model_config.get('base_url') if model_config else 'https://api.openai.com/v1'
             model_name = model_config.get('model_name') if model_config else 'gpt-3.5-turbo'
             
@@ -153,6 +156,50 @@ class LLMService:
             response.raise_for_status()
             result = response.json()
             return result['choices'][0]['message']['content']
+        elif provider == 'anthropic':
+            # Anthropic Claude API support
+            import os
+            api_key = model_config.get('api_key') if model_config else os.getenv('ANTHROPIC_API_KEY')
+            if not api_key:
+                raise ValueError("Anthropic API key is required. Set it in model_config or ANTHROPIC_API_KEY environment variable.")
+            
+            base_url = model_config.get('base_url') if model_config else 'https://api.anthropic.com/v1'
+            model_name = model_config.get('model_name') if model_config else 'claude-3-sonnet-20240229'
+            
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json"
+            }
+            
+            # Convert messages format for Anthropic (system message separate)
+            system_message = None
+            user_messages = []
+            for msg in messages:
+                if msg.get('role') == 'system':
+                    system_message = msg.get('content', '')
+                else:
+                    user_messages.append(msg)
+            
+            payload = {
+                "model": model_name,
+                "max_tokens": 4096,
+                "temperature": temperature,
+                "messages": user_messages
+            }
+            
+            if system_message:
+                payload["system"] = system_message
+            
+            response = requests.post(
+                f"{base_url}/messages",
+                headers=headers,
+                json=payload,
+                timeout=120
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result['content'][0]['text']
         else:
-            raise NotImplementedError(f"Provider '{provider}' not yet implemented")
+            raise NotImplementedError(f"Provider '{provider}' not yet implemented. Supported providers: ollama, openai, anthropic")
 

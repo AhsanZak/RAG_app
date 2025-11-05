@@ -241,37 +241,52 @@ class NLToSQLAgent:
             schema_text = self._format_schema_for_llm(schema_details)
             relevant_schema_text = schema_text
         
+        # Build enhanced schema context with structured metadata
+        structured_schema_info = self._build_structured_schema_context(schema_details)
+        
         prompt = f"""You are an expert SQL query generator specializing in {database_type.upper()} databases. 
 Convert the following natural language query into a valid {database_type.upper()} SQL query.
 
 Database Type: {database_type.upper()}
 
-Relevant Schema Information (semantically matched from database):
+=== STRUCTURED SCHEMA METADATA ===
+{structured_schema_info}
+
+=== SEMANTICALLY RELEVANT SCHEMA CHUNKS (from vectorized search) ===
 {relevant_schema_text}
 
-User Query: "{user_query}"
+=== USER QUERY ===
+"{user_query}"
 
-Instructions:
-1. Carefully analyze the schema structure including table names, columns, data types, constraints, and relationships
-2. Generate a valid {database_type.upper()} SQL query that matches the query intent
-3. Use ONLY tables and columns that exist in the provided schema - verify names exactly
-4. Pay attention to foreign key relationships to properly JOIN related tables
-5. Include appropriate WHERE clauses based on the query intent
-6. Use aggregate functions (COUNT, SUM, AVG, MAX, MIN) when the query requires calculations
-7. Add GROUP BY when using aggregate functions with non-aggregated columns
-8. Add ORDER BY when the query should return sorted results
-9. Limit results appropriately using LIMIT (PostgreSQL, MySQL) or TOP (MSSQL) clauses
-10. Respect NOT NULL constraints and data types when constructing conditions
-11. Use proper JOIN syntax (INNER, LEFT, RIGHT) based on relationship requirements
+=== INSTRUCTIONS ===
+1. **Schema Analysis**: Use BOTH the structured metadata (table names, relationships) AND the semantically matched chunks (detailed column info) to understand the database structure
+2. **Table Selection**: Identify which tables are needed based on the query. Use the structured metadata to see all available tables and relationships
+3. **Column Selection**: Use the semantically matched chunks to find exact column names, types, and constraints
+4. **Relationships**: Use foreign key information from structured metadata to properly JOIN tables
+5. **Query Generation**: 
+   - Generate valid {database_type.upper()} SQL syntax
+   - Use ONLY tables and columns that exist in the schema
+   - Verify table/column names exactly (case-sensitive where applicable)
+   - Include appropriate WHERE, JOIN, GROUP BY, ORDER BY, and LIMIT clauses
+6. **Best Practices**:
+   - Use aggregate functions (COUNT, SUM, AVG, MAX, MIN) when needed
+   - Add GROUP BY when using aggregates with non-aggregated columns
+   - Use proper JOIN syntax (INNER, LEFT, RIGHT) based on relationships
+   - Respect data types and constraints
+   - Limit results appropriately (LIMIT for PostgreSQL/MySQL, TOP for MSSQL)
 
-Important: The schema information above was retrieved using semantic search based on your query. 
-Use this context to understand the database structure and relationships.
+=== IMPORTANT NOTES ===
+- The structured metadata shows ALL tables and relationships in the database
+- The semantic chunks show DETAILED information about columns relevant to your query
+- Combine both sources to ensure accurate SQL generation
+- If a table/column is mentioned in the query but not found in the schema, exclude it and note this in reasoning
 
+=== OUTPUT FORMAT ===
 Respond in JSON format:
 {{
     "sql": "the SQL query here",
     "confidence": 0.0-1.0,
-    "reasoning": "explanation of the query",
+    "reasoning": "explanation of how you used the schema information and generated the query",
     "tables_used": ["table1", "table2"],
     "columns_used": ["column1", "column2"]
 }}
@@ -313,33 +328,72 @@ Respond in JSON format:
             print(f"[NLToSQL] Error: {str(e)}")
         
         return {
-            'sql': '',
+            'sql': None,
             'confidence': 0.0,
-            'reasoning': f'Error generating SQL: {str(e)}',
+            'reasoning': 'Failed to generate SQL',
             'tables_used': [],
             'columns_used': [],
-            'relevant_schema_parts': []
+            'relevant_schema_parts': relevant_schema_parts
         }
     
+    def _build_structured_schema_context(self, schema_details: Dict[str, Any]) -> str:
+        """
+        Build structured schema context with metadata for better SQL generation
+        Includes table names, relationships, and summary statistics
+        """
+        if not schema_details or 'tables' not in schema_details:
+            return "No schema information available"
+        
+        lines = []
+        metadata = schema_details.get('metadata', {})
+        tables = schema_details.get('tables', [])
+        
+        # Summary
+        lines.append(f"Database Summary:")
+        lines.append(f"  - Total Tables: {metadata.get('total_tables', len(tables))}")
+        lines.append(f"  - Total Columns: {metadata.get('total_columns', 0)}")
+        lines.append(f"  - Database Type: {schema_details.get('database_type', 'unknown')}")
+        lines.append("")
+        
+        # Table list
+        table_names = [t.get('name', '') for t in tables if t.get('name')]
+        if table_names:
+            lines.append(f"All Tables in Database ({len(table_names)}):")
+            lines.append(f"  {', '.join(sorted(table_names))}")
+            lines.append("")
+        
+        # Relationships summary
+        relationships = []
+        for table in tables:
+            fks = table.get('foreign_keys', [])
+            for fk in fks:
+                relationships.append(
+                    f"{table.get('name')}.{', '.join(fk.get('constrained_columns', []))} -> "
+                    f"{fk.get('referred_table')}.{', '.join(fk.get('referred_columns', []))}"
+                )
+        
+        if relationships:
+            lines.append("Key Relationships:")
+            for rel in relationships[:20]:  # Limit to top 20 relationships
+                lines.append(f"  - {rel}")
+            lines.append("")
+        
+        return '\n'.join(lines)
+    
     def _format_schema_for_llm(self, schema_details: Dict[str, Any]) -> str:
-        """Format schema details for LLM prompt"""
+        """Format schema details for LLM prompt (detailed version)"""
         if not schema_details or 'tables' not in schema_details:
             return "No schema information available"
         
         lines = []
         for table in schema_details.get('tables', []):
             lines.append(f"\nTable: {table.get('name', 'unknown')}")
-            if table.get('schema'):
-                lines.append(f"  Schema: {table['schema']}")
             
             # Columns
             if table.get('columns'):
                 lines.append("  Columns:")
                 for col in table['columns']:
-                    col_line = f"    - {col['name']}: {col['type']}"
-                    if not col.get('nullable', True):
-                        col_line += " (NOT NULL)"
-                    lines.append(col_line)
+                    lines.append(f"    - {col['name']}: {col['type']}")
             
             # Primary Keys
             if table.get('primary_keys'):
@@ -502,8 +556,52 @@ Respond in JSON format:
                 'validated_columns': []
             }
     
+    def _build_structured_schema_context(self, schema_details: Dict[str, Any]) -> str:
+        """
+        Build structured schema context with metadata for better SQL generation
+        Includes table names, relationships, and summary statistics
+        """
+        if not schema_details or 'tables' not in schema_details:
+            return "No schema information available"
+        
+        lines = []
+        metadata = schema_details.get('metadata', {})
+        tables = schema_details.get('tables', [])
+        
+        # Summary
+        lines.append(f"Database Summary:")
+        lines.append(f"  - Total Tables: {metadata.get('total_tables', len(tables))}")
+        lines.append(f"  - Total Columns: {metadata.get('total_columns', 0)}")
+        lines.append(f"  - Database Type: {schema_details.get('database_type', 'unknown')}")
+        lines.append("")
+        
+        # Table list
+        table_names = [t.get('name', '') for t in tables if t.get('name')]
+        if table_names:
+            lines.append(f"All Tables in Database ({len(table_names)}):")
+            lines.append(f"  {', '.join(sorted(table_names))}")
+            lines.append("")
+        
+        # Relationships summary
+        relationships = []
+        for table in tables:
+            fks = table.get('foreign_keys', [])
+            for fk in fks:
+                relationships.append(
+                    f"{table.get('name')}.{', '.join(fk.get('constrained_columns', []))} -> "
+                    f"{fk.get('referred_table')}.{', '.join(fk.get('referred_columns', []))}"
+                )
+        
+        if relationships:
+            lines.append("Key Relationships:")
+            for rel in relationships[:20]:  # Limit to top 20 relationships
+                lines.append(f"  - {rel}")
+            lines.append("")
+        
+        return '\n'.join(lines)
+    
     def _format_schema_for_llm(self, schema_details: Dict[str, Any]) -> str:
-        """Format schema details for LLM prompt"""
+        """Format schema details for LLM prompt (detailed version)"""
         if not schema_details or 'tables' not in schema_details:
             return "No schema information available"
         
