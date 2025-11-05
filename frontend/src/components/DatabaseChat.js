@@ -207,22 +207,85 @@ const DatabaseChat = ({ onBack }) => {
     });
   };
 
+  const loadSessions = async (connectionId = null) => {
+    try {
+      const sessionsData = await databaseChatAPI.getSessions(1, connectionId);
+      // Filter for database sessions only
+      const dbSessions = sessionsData.filter(s => s.session_type === 'database');
+      setSessions(dbSessions);
+      
+      // If there's a current session and it's in the list, keep it selected
+      // Otherwise, select the most recent session
+      if (dbSessions.length > 0) {
+        const existingSession = dbSessions.find(s => s.id === currentSession?.id);
+        if (existingSession) {
+          setCurrentSession(existingSession);
+          await handleSelectSession(existingSession);
+        } else {
+          // Select the most recent session
+          const mostRecent = dbSessions.sort((a, b) => 
+            new Date(b.created_at) - new Date(a.created_at)
+          )[0];
+          setCurrentSession(mostRecent);
+          await handleSelectSession(mostRecent);
+        }
+      } else {
+        setCurrentSession(null);
+        setChatMessages([]);
+        setSessionReady(false);
+      }
+    } catch (error) {
+      console.error('Error loading sessions:', error);
+      setSessions([]);
+      setCurrentSession(null);
+    }
+  };
+
+  const handleSelectSession = async (session) => {
+    setCurrentSession(session);
+    setSessionReady(session.hasVectorizedData || false);
+    
+    try {
+      // Load messages for this session
+      const messagesData = await databaseChatAPI.getSessionMessages(session.id);
+      const formattedMessages = messagesData.map(msg => ({
+        id: msg.id,
+        role: msg.role,
+        content: msg.message || msg.content,
+        timestamp: new Date(msg.created_at),
+        metadata: msg.metadata || {}
+      }));
+      setChatMessages(formattedMessages);
+    } catch (error) {
+      console.error('Error loading session messages:', error);
+      setChatMessages([]);
+    }
+  };
+
   const handleSelectConnection = async (connection) => {
     setCurrentConnection(connection);
     setChatMessages([]);
     setSessionReady(false);
+    setCurrentSession(null);
     
     // Try to load existing schema
     try {
       const schema = await databaseChatAPI.getSchema(connection.id);
       if (schema && schema.schema_data) {
         setSchemaData(schema);
+        // Check if schema has a session_id (processed schema)
+        if (schema.session_id) {
+          // Load sessions for this connection
+          await loadSessions(connection.id);
+        }
       } else {
         setSchemaData(null);
+        setSessions([]);
       }
     } catch (error) {
       // No schema found, that's okay
       setSchemaData(null);
+      setSessions([]);
     }
   };
 
@@ -285,20 +348,30 @@ const DatabaseChat = ({ onBack }) => {
       });
 
       if (result.success) {
-        // Create session object
-        const newSession = {
+        // Reload sessions to get the new session with all details
+        const sessionsData = await databaseChatAPI.getSessions(1, currentConnection.id);
+        const dbSessions = sessionsData.filter(s => s.session_type === 'database');
+        setSessions(dbSessions);
+        
+        // Find the newly created session
+        const newSession = dbSessions.find(s => s.id === result.session_id) || {
           id: result.session_id,
           name: sessionName,
           createdAt: new Date(),
           status: 'ready',
-          hasVectorizedData: true
+          hasVectorizedData: true,
+          session_type: 'database',
+          connection_id: currentConnection.id,
+          message_count: 0
         };
-
-        setSessions([newSession]);
+        
         setCurrentSession(newSession);
         setSessionReady(true);
         
-        // Inject preview as first assistant message
+        // Load messages for the new session (will be empty initially)
+        await handleSelectSession(newSession);
+        
+        // Inject preview as first assistant message if available
         if (result.preview && result.preview.summary) {
           const assistantPreview = {
             id: `preview_${Date.now()}`,
@@ -306,7 +379,7 @@ const DatabaseChat = ({ onBack }) => {
             content: result.preview.summary,
             timestamp: new Date()
           };
-          setChatMessages([assistantPreview]);
+          setChatMessages(prev => [assistantPreview, ...prev]);
         }
 
         Modal.success({
@@ -372,6 +445,11 @@ const DatabaseChat = ({ onBack }) => {
       };
       
       setChatMessages(prev => [...prev, assistantResponse]);
+      
+      // Reload sessions to update message count
+      if (currentConnection) {
+        await loadSessions(currentConnection.id);
+      }
     } catch (error) {
       console.error('Chat error:', error);
       message.error(error.response?.data?.detail || 'Failed to send message');
@@ -582,6 +660,41 @@ const DatabaseChat = ({ onBack }) => {
                     </>
                   )}
                 </Space>
+              </Card>
+            )}
+
+            {/* Sessions List - similar to PDF Chat */}
+            {currentConnection && sessions.length > 0 && (
+              <Card
+                className="sidebar-sessions"
+                size="small"
+                title="Chat Sessions"
+                style={{ marginTop: 12 }}
+              >
+                <List
+                  size="small"
+                  dataSource={sessions}
+                  renderItem={(session) => (
+                    <List.Item
+                      className={`session-item ${currentSession?.id === session.id ? 'active' : ''}`}
+                      onClick={() => handleSelectSession(session)}
+                    >
+                      <List.Item.Meta
+                        avatar={<DatabaseOutlined />}
+                        title={<span style={{ fontSize: 13 }}>{session.name}</span>}
+                        description={
+                          <span style={{ fontSize: 12 }}>
+                            {session.message_count || 0} messages
+                            {session.hasVectorizedData ? ' - Ready' : ' - Processing'}
+                          </span>
+                        }
+                      />
+                      {session.hasVectorizedData && (
+                        <Tag color="green" style={{ marginInlineStart: 6 }}>Ready</Tag>
+                      )}
+                    </List.Item>
+                  )}
+                />
               </Card>
             )}
           </div>

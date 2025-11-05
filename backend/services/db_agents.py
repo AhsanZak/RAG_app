@@ -19,13 +19,6 @@ from services.chromadb_service import ChromaDBService
 class IntentDetectionAgent:
     """Agent to detect user intent - whether they need SQL query or general chat"""
     
-    INTENT_SQL_KEYWORDS = [
-        'query', 'select', 'find', 'get', 'show', 'list', 'retrieve', 'fetch',
-        'count', 'sum', 'average', 'avg', 'max', 'min', 'group', 'join',
-        'where', 'filter', 'search', 'database', 'table', 'column', 'rows',
-        'records', 'data', 'information', 'extract', 'display'
-    ]
-    
     def __init__(self, llm_service: LLMService, embedding_service: Optional[EmbeddingService] = None,
                  chromadb_service: Optional[ChromaDBService] = None, model_config: Optional[Dict] = None):
         self.llm_service = llm_service
@@ -37,6 +30,7 @@ class IntentDetectionAgent:
                       collection_name: Optional[str] = None, embedding_model_name: Optional[str] = None) -> Dict[str, Any]:
         """
         Detect if user intent requires SQL query
+        Uses LLM and semantic search - no hardcoded keyword matching
         
         Returns:
             {
@@ -46,30 +40,21 @@ class IntentDetectionAgent:
                 'reasoning': str
             }
         """
-        user_query_lower = user_query.lower()
-        
-        # Quick keyword check
-        has_sql_keywords = any(keyword in user_query_lower for keyword in self.INTENT_SQL_KEYWORDS)
         
         # Use semantic search to get relevant schema context if available
         relevant_context = schema_context
         if collection_name and self.embedding_service and self.chromadb_service:
             try:
-                # Expand query with synonyms for better semantic matching
-                expanded_queries = self._expand_query_with_synonyms(user_query)
-                
-                # Convert all expanded queries to embeddings
-                all_queries = [user_query] + expanded_queries
+                # Convert user query to embedding - rely purely on embedding model's semantic understanding
+                # No query expansion - embedding models handle semantic similarity automatically
                 query_embeddings = self.embedding_service.generate_embeddings(
-                    all_queries,
+                    [user_query],
                     model_name=embedding_model_name
                 )
                 
-                # Use the first (original) query embedding for retrieval
+                # Ensure query_embeddings is a 2D array (1 x dimension)
                 if query_embeddings.ndim == 1:
                     query_embeddings = query_embeddings.reshape(1, -1)
-                else:
-                    query_embeddings = query_embeddings[0:1]  # Use first query
                 
                 # Retrieve relevant schema chunks
                 results = self.chromadb_service.query_collection(
@@ -95,8 +80,16 @@ Relevant Schema Context (semantically matched): {relevant_context[:800] if relev
 
 Determine:
 1. Does this query require fetching data from the database using SQL? (requires_sql: true/false)
-2. What type of intent is this? (sql_query, schema_question, general_chat)
+2. What type of intent is this?
+   - "sql_query": Query needs to fetch actual data rows from tables (e.g., "show me all customers", "find orders from 2020")
+   - "schema_question": Question about database structure/metadata (e.g., "how many tables", "list all tables", "what columns in table X", "does table Y exist")
+   - "general_chat": General conversation not related to data or schema
 3. Confidence level (0.0 to 1.0)
+
+Examples:
+- "how many tables in the database" → intent_type: "schema_question", requires_sql: false
+- "show me all movies" → intent_type: "sql_query", requires_sql: true
+- "what is a database" → intent_type: "general_chat", requires_sql: false
 
 Respond in JSON format:
 {{
@@ -117,64 +110,38 @@ Respond in JSON format:
             # Extract JSON from response
             json_match = re.search(r'\{[^}]+\}', response, re.DOTALL)
             if json_match:
-                result = json.loads(json_match.group())
-                return {
-                    'requires_sql': result.get('requires_sql', has_sql_keywords),
-                    'confidence': result.get('confidence', 0.8 if has_sql_keywords else 0.3),
-                    'intent_type': result.get('intent_type', 'sql_query' if has_sql_keywords else 'general_chat'),
-                    'reasoning': result.get('reasoning', '')
-                }
+                try:
+                    result = json.loads(json_match.group())
+                    # Use LLM's determination - no hardcoded fallbacks
+                    return {
+                        'requires_sql': result.get('requires_sql', False),
+                        'confidence': result.get('confidence', 0.7),
+                        'intent_type': result.get('intent_type', 'general_chat'),
+                        'reasoning': result.get('reasoning', '')
+                    }
+                except json.JSONDecodeError:
+                    pass
         except Exception as e:
             print(f"[IntentDetection] Error: {str(e)}")
         
-        # Fallback to keyword-based detection
+        # Fallback: assume general chat if LLM analysis fails
+        # No hardcoded keyword matching - rely on LLM understanding
         return {
-            'requires_sql': has_sql_keywords,
-            'confidence': 0.7 if has_sql_keywords else 0.3,
-            'intent_type': 'sql_query' if has_sql_keywords else 'general_chat',
-            'reasoning': 'Keyword-based detection'
+            'requires_sql': False,
+            'confidence': 0.3,
+            'intent_type': 'general_chat',
+            'reasoning': 'LLM analysis unavailable - defaulting to general chat'
         }
     
     def _expand_query_with_synonyms(self, query: str) -> List[str]:
         """
-        Expand query semantically without hardcoded mappings
-        Uses linguistic variations that embedding models can understand
+        No hardcoded query expansion - rely purely on embedding models
+        Embedding models (BGE, MPNet, etc.) already understand semantic similarity
         """
-        query_lower = query.lower()
-        expanded = []
-        
-        # Simple linguistic variations that help semantic matching
-        # These are general language patterns, not domain-specific
-        variations = []
-        
-        # Plural/singular variations (general language, not hardcoded)
-        words = query_lower.split()
-        for i, word in enumerate(words):
-            # Simple pluralization patterns (very basic, embedding models handle most of this)
-            if word.endswith('s') and len(word) > 3:
-                # Try singular
-                singular = word[:-1]
-                new_words = words.copy()
-                new_words[i] = singular
-                variations.append(' '.join(new_words))
-            elif not word.endswith('s') and len(word) > 2:
-                # Try plural
-                plural = word + 's'
-                new_words = words.copy()
-                new_words[i] = plural
-                variations.append(' '.join(new_words))
-        
-        # Add simple query reformulations that help semantic search
-        # These are general query patterns, not domain-specific
-        if 'show' in query_lower or 'display' in query_lower:
-            variations.append(query_lower.replace('show', 'list').replace('display', 'list'))
-        if 'find' in query_lower:
-            variations.append(query_lower.replace('find', 'get'))
-        if 'how many' in query_lower:
-            variations.append(query_lower.replace('how many', 'count'))
-        
-        # Return unique variations (limited to avoid too many queries)
-        return list(set(variations))[:3]
+        # Return empty list - no query expansion needed
+        # Embedding models handle semantic matching automatically
+        # They understand "movies" → "film", "show" → "list", etc. through training
+        return []
 
 
 class NLToSQLAgent:
@@ -214,21 +181,16 @@ class NLToSQLAgent:
         
         if collection_name:
             try:
-                # Expand query with synonyms for better semantic matching
-                expanded_queries = self._expand_query_with_synonyms(user_query)
-                
-                # Convert all expanded queries to embeddings for semantic search
-                all_queries = [user_query] + expanded_queries
+                # Convert user query to embedding - rely purely on embedding model's semantic understanding
+                # No query expansion - embedding models (BGE, MPNet, etc.) handle semantic similarity
                 query_embeddings = self.embedding_service.generate_embeddings(
-                    all_queries,
+                    [user_query],
                     model_name=embedding_model_name
                 )
                 
-                # Use the first (original) query embedding for retrieval
+                # Ensure query_embeddings is a 2D array (1 x dimension)
                 if query_embeddings.ndim == 1:
                     query_embeddings = query_embeddings.reshape(1, -1)
-                else:
-                    query_embeddings = query_embeddings[0:1]  # Use first query
                 
                 # Retrieve relevant schema chunks using semantic search
                 results = self.chromadb_service.query_collection(
@@ -638,7 +600,20 @@ class DatabaseAgentSystem:
         result['intent'] = intent_result
         
         if not intent_result.get('requires_sql'):
-            # Step 2a: General chat response (no SQL needed)
+            # Step 2a: Check if this is a schema metadata question
+            intent_type = intent_result.get('intent_type', 'general_chat')
+            
+            # Handle schema metadata questions using full schema_details
+            if intent_type == 'schema_question':
+                schema_metadata_response = self._handle_schema_metadata_question(
+                    user_query,
+                    schema_details
+                )
+                if schema_metadata_response:
+                    result['chat_response'] = schema_metadata_response
+                    return result
+            
+            # Step 2b: General chat response (no SQL needed)
             chat_response = self._generate_chat_response(
                 user_query, 
                 schema_details, 
@@ -704,6 +679,66 @@ class DatabaseAgentSystem:
         
         return result
     
+    def _handle_schema_metadata_question(
+        self,
+        user_query: str,
+        schema_details: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Handle schema metadata questions using full extracted schema details
+        No hardcoded lists - uses actual schema_data structure
+        """
+        if not schema_details or 'tables' not in schema_details:
+            return None
+        
+        query_lower = user_query.lower().strip()
+        metadata = schema_details.get('metadata', {})
+        tables = schema_details.get('tables', [])
+        
+        # Extract accurate counts from schema metadata
+        total_tables = metadata.get('total_tables', len(tables))
+        total_columns = metadata.get('total_columns', 0)
+        
+        # Count columns if not in metadata
+        if total_columns == 0:
+            for table in tables:
+                total_columns += len(table.get('columns', []))
+        
+        # Get all table names from schema
+        table_names = [table.get('name', '') for table in tables if table.get('name')]
+        
+        # Handle "how many tables" questions
+        if any(phrase in query_lower for phrase in ['how many table', 'count of table', 'number of table', 'total table']):
+            return f"There are **{total_tables} tables** in the database."
+        
+        # Handle "list all tables" questions
+        if any(phrase in query_lower for phrase in ['list all table', 'show all table', 'what table', 'which table', 'name of table', 'table name', 'table available']):
+            if table_names:
+                table_list = ', '.join(sorted(table_names))
+                return f"The database contains **{total_tables} tables**:\n\n{table_list}"
+            else:
+                return f"The database contains **{total_tables} tables**, but I couldn't retrieve their names."
+        
+        # Handle "how many columns" questions
+        if any(phrase in query_lower for phrase in ['how many column', 'count of column', 'number of column', 'total column']):
+            return f"There are **{total_columns} columns** across all tables in the database."
+        
+        # Handle "what columns in table X" questions
+        # Extract table name from query
+        for table_name in table_names:
+            if table_name.lower() in query_lower:
+                table_info = next((t for t in tables if t.get('name', '').lower() == table_name.lower()), None)
+                if table_info:
+                    columns = table_info.get('columns', [])
+                    if columns:
+                        column_list = ', '.join([col.get('name', '') for col in columns])
+                        return f"The **{table_name}** table has **{len(columns)} columns**:\n\n{column_list}"
+                    else:
+                        return f"The **{table_name}** table exists but I couldn't retrieve its column information."
+        
+        # If no specific pattern matched, return None to fall back to general chat
+        return None
+    
     def _generate_chat_response(
         self,
         user_query: str,
@@ -712,7 +747,24 @@ class DatabaseAgentSystem:
         previous_context: Optional[List[Dict]] = None
     ) -> str:
         """Generate chat response for non-SQL queries"""
-        context = f"Database Schema Context:\n{schema_text[:1000]}"
+        # Build context with full schema metadata for accuracy
+        context_parts = []
+        
+        # Include schema metadata for accurate answers
+        if schema_details and 'metadata' in schema_details:
+            metadata = schema_details['metadata']
+            context_parts.append(
+                f"Schema Metadata:\n"
+                f"- Total Tables: {metadata.get('total_tables', 0)}\n"
+                f"- Total Columns: {metadata.get('total_columns', 0)}\n"
+                f"- Database Type: {schema_details.get('database_type', 'unknown')}\n"
+            )
+        
+        # Include schema text
+        if schema_text:
+            context_parts.append(f"Database Schema Context:\n{schema_text[:1000]}")
+        
+        context = "\n\n".join(context_parts) if context_parts else "Database Schema Context: Not available"
         
         if previous_context:
             messages = previous_context + [{"role": "user", "content": user_query}]

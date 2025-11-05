@@ -247,6 +247,16 @@ export const databaseChatAPI = {
     const response = await api.get(`/api/sessions/${sessionId}/messages`);
     return response.data;
   },
+
+  // Get all sessions (optionally filtered by connection_id)
+  getSessions: async (userId = 1, connectionId = null) => {
+    let url = `/api/sessions?user_id=${userId}`;
+    if (connectionId) {
+      url += `&connection_id=${connectionId}`;
+    }
+    const response = await api.get(url);
+    return response.data;
+  },
 };
 
 export default api;
