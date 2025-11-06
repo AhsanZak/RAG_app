@@ -432,6 +432,36 @@ const DatabaseChat = ({ onBack }) => {
         modelToUse
       );
 
+      // Debug: Log the response to see what we're getting
+      console.log('=== Database Chat Response Debug ===');
+      console.log('Full response object:', response);
+      console.log('query_result:', response.query_result);
+      console.log('query_result type:', typeof response.query_result);
+      console.log('query_result is array:', Array.isArray(response.query_result));
+      console.log('query_result length:', response.query_result?.length || 0);
+      console.log('query_result_count:', response.query_result_count);
+      console.log('query_result_columns:', response.query_result_columns);
+      console.log('sql_executed:', response.sql_executed);
+      console.log('sql:', response.sql);
+      console.log('===================================');
+
+      // Ensure query_result is always an array
+      let queryResultArray = [];
+      if (response.query_result) {
+        if (Array.isArray(response.query_result)) {
+          queryResultArray = response.query_result;
+        } else if (typeof response.query_result === 'object' && response.query_result.data) {
+          // Handle case where data is nested
+          queryResultArray = Array.isArray(response.query_result.data) ? response.query_result.data : [];
+        }
+      }
+
+      // Extract columns
+      let queryResultColumns = response.query_result_columns || [];
+      if (queryResultColumns.length === 0 && queryResultArray.length > 0 && typeof queryResultArray[0] === 'object') {
+        queryResultColumns = Object.keys(queryResultArray[0]);
+      }
+
       const assistantResponse = {
         id: response.message_id || Date.now() + 1,
         role: 'assistant',
@@ -439,10 +469,19 @@ const DatabaseChat = ({ onBack }) => {
         timestamp: new Date(),
         sources: response.sources || [],
         sql: response.sql,
-        sqlExecuted: response.sql_executed,
-        queryResult: response.query_result,
+        sqlExecuted: response.sql_executed || false,
+        queryResult: queryResultArray,
+        queryResultCount: response.query_result_count || queryResultArray.length,
+        queryResultColumns: queryResultColumns,
         metadata: response.metadata || {}
       };
+
+      console.log('=== Processed Assistant Response ===');
+      console.log('queryResult length:', assistantResponse.queryResult.length);
+      console.log('queryResultCount:', assistantResponse.queryResultCount);
+      console.log('queryResultColumns:', assistantResponse.queryResultColumns);
+      console.log('sqlExecuted:', assistantResponse.sqlExecuted);
+      console.log('===================================');
       
       setChatMessages(prev => [...prev, assistantResponse]);
       
@@ -755,6 +794,16 @@ const DatabaseChat = ({ onBack }) => {
                             <div className="message-bubble">
                               <Markdown>{message.content}</Markdown>
                               
+                              {/* Debug info - remove in production */}
+                              {process.env.NODE_ENV === 'development' && message.sqlExecuted && (
+                                <div style={{ marginTop: 8, padding: 4, background: '#fff3cd', borderRadius: 4, fontSize: '10px' }}>
+                                  <strong>Debug:</strong> sqlExecuted={String(message.sqlExecuted)}, 
+                                  hasQueryResult={String(!!message.queryResult)}, 
+                                  queryResultLength={message.queryResult?.length || 0},
+                                  queryResultType={typeof message.queryResult}
+                                </div>
+                              )}
+                              
                               {/* Show SQL query if executed */}
                               {message.sql && message.sqlExecuted && (
                                 <div style={{ marginTop: 12, padding: 8, background: '#f5f5f5', borderRadius: 4 }}>
@@ -766,40 +815,62 @@ const DatabaseChat = ({ onBack }) => {
                               )}
                               
                               {/* Show query results if available */}
-                              {message.queryResult && message.queryResult.length > 0 && (
+                              {message.sqlExecuted && message.sql && message.queryResult && Array.isArray(message.queryResult) && message.queryResult.length > 0 ? (
                                 <div style={{ marginTop: 12 }}>
-                                  <Text strong style={{ fontSize: '12px' }}>Query Results ({message.queryResult.length} rows):</Text>
-                                  <div style={{ marginTop: 8, maxHeight: '300px', overflow: 'auto' }}>
+                                  <Text strong style={{ fontSize: '12px' }}>
+                                    Query Results {message.queryResultCount && message.queryResultCount !== message.queryResult.length 
+                                      ? `(${message.queryResultCount} total, showing ${message.queryResult.length})` 
+                                      : `(${message.queryResult.length} ${message.queryResult.length === 1 ? 'row' : 'rows'})`}:
+                                  </Text>
+                                  <div style={{ marginTop: 8, maxHeight: '500px', overflow: 'auto', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' }}>
                                     <table style={{ width: '100%', fontSize: '12px', borderCollapse: 'collapse' }}>
                                       <thead>
-                                        <tr style={{ background: '#f0f0f0' }}>
-                                          {Object.keys(message.queryResult[0]).map((key) => (
-                                            <th key={key} style={{ padding: '4px 8px', textAlign: 'left', border: '1px solid #ddd' }}>
+                                        <tr style={{ background: '#f0f0f0', position: 'sticky', top: 0, zIndex: 1 }}>
+                                          {(message.queryResultColumns && message.queryResultColumns.length > 0
+                                            ? message.queryResultColumns
+                                            : Object.keys(message.queryResult[0])
+                                          ).map((key) => (
+                                            <th key={key} style={{ padding: '8px', textAlign: 'left', border: '1px solid #ddd', fontWeight: 'bold' }}>
                                               {key}
                                             </th>
                                           ))}
                                         </tr>
                                       </thead>
                                       <tbody>
-                                        {message.queryResult.slice(0, 10).map((row, idx) => (
-                                          <tr key={idx}>
-                                            {Object.values(row).map((val, valIdx) => (
-                                              <td key={valIdx} style={{ padding: '4px 8px', border: '1px solid #ddd' }}>
-                                                {String(val || '')}
+                                        {message.queryResult.map((row, idx) => (
+                                          <tr key={idx} style={{ background: idx % 2 === 0 ? '#fff' : '#fafafa' }}>
+                                            {(message.queryResultColumns && message.queryResultColumns.length > 0
+                                              ? message.queryResultColumns
+                                              : Object.keys(message.queryResult[0])
+                                            ).map((col, colIdx) => (
+                                              <td key={colIdx} style={{ padding: '6px 8px', border: '1px solid #ddd', wordBreak: 'break-word' }}>
+                                                {String(row[col] !== null && row[col] !== undefined ? row[col] : '')}
                                               </td>
                                             ))}
                                           </tr>
                                         ))}
                                       </tbody>
                                     </table>
-                                    {message.queryResult.length > 10 && (
-                                      <Text type="secondary" style={{ fontSize: '11px', marginTop: 4 }}>
-                                        Showing first 10 of {message.queryResult.length} rows
-                                      </Text>
+                                    {message.queryResultCount && message.queryResultCount > message.queryResult.length && (
+                                      <div style={{ padding: '8px', background: '#f9f9f9', borderTop: '1px solid #ddd', textAlign: 'center' }}>
+                                        <Text type="secondary" style={{ fontSize: '11px' }}>
+                                          Showing {message.queryResult.length} of {message.queryResultCount} rows
+                                        </Text>
+                                      </div>
                                     )}
                                   </div>
                                 </div>
-                              )}
+                              ) : message.sqlExecuted && message.sql ? (
+                                // Show message if SQL executed but no results
+                                <div style={{ marginTop: 12, padding: 8, background: '#fff3cd', borderRadius: 4 }}>
+                                  <Text type="warning" style={{ fontSize: '12px' }}>
+                                    Query executed successfully but returned no results. 
+                                    {process.env.NODE_ENV === 'development' && (
+                                      <span> (Debug: queryResult={String(!!message.queryResult)}, length={message.queryResult?.length || 0})</span>
+                                    )}
+                                  </Text>
+                                </div>
+                              ) : null}
                             </div>
                             {message.sources && message.sources.length > 0 && (
                               <div className="message-sources">
