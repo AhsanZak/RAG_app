@@ -169,6 +169,66 @@ export const pdfChatAPI = {
   },
 };
 
+// Excel Chat API
+export const excelChatAPI = {
+  // Upload Excel file
+  uploadExcel: async (file) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('user_id', '1');
+    
+    const response = await api.post('/api/excel/upload', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+    return response.data;
+  },
+
+  // Process Excel files and create session
+  processExcels: async (files, sessionName, llmModelId, embeddingModelId, embeddingModelName) => {
+    const payload = {
+      files: files,
+      user_id: 1,
+      session_name: sessionName,
+      llm_model_id: llmModelId || 1,
+    };
+    
+    // Include embedding model ID or name
+    if (embeddingModelId) {
+      payload.embedding_model_id = embeddingModelId;
+    } else if (embeddingModelName) {
+      payload.embedding_model_name = embeddingModelName;
+    }
+    
+    const response = await api.post('/api/excel/process', payload);
+    return response.data;
+  },
+
+  // Chat with Excel documents
+  chat: async (sessionId, message, modelId) => {
+    const response = await api.post('/api/excel/chat', {
+      session_id: sessionId,
+      message: message,
+      model_id: modelId,
+      user_id: 1
+    });
+    return response.data;
+  },
+
+  // Get all sessions (reuse from pdfChatAPI)
+  getSessions: async (userId = 1) => {
+    const response = await api.get(`/api/sessions?user_id=${userId}`);
+    return response.data;
+  },
+
+  // Get session messages (reuse from pdfChatAPI)
+  getSessionMessages: async (sessionId) => {
+    const response = await api.get(`/api/sessions/${sessionId}/messages`);
+    return response.data;
+  },
+};
+
 // Database Chat API
 export const databaseChatAPI = {
   // Create database connection

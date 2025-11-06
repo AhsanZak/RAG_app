@@ -14,6 +14,7 @@ import ChatInterface from './components/ChatInterface';
 import ChatTypeSelector from './components/ChatTypeSelector';
 import PDFChat from './components/PDFChat';
 import DatabaseChat from './components/DatabaseChat';
+import ExcelChat from './components/ExcelChat';
 
 const { Header, Content, Footer, Sider } = Layout;
 const { Title, Paragraph } = Typography;
@@ -71,7 +72,10 @@ function App() {
         if (selectedChatType === 'database') {
           return <DatabaseChat onBack={handleBackToChatTypes} />;
         }
-        // TODO: Add other chat types (excel, text, word, general)
+        if (selectedChatType === 'excel') {
+          return <ExcelChat onBack={handleBackToChatTypes} />;
+        }
+        // TODO: Add other chat types (text, word, general)
         return <ChatTypeSelector onSelectChatType={handleSelectChatType} />;
       case 'chat':
         return <ChatInterface />;

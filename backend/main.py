@@ -7,8 +7,20 @@ import requests
 import json
 import aiofiles
 import os
+import sys
 from datetime import datetime
 from sqlalchemy.orm import Session
+
+# Fix for Windows multiprocessing DLL issues with PyTorch
+if sys.platform == 'win32':
+    import multiprocessing
+    # Set multiprocessing start method to 'spawn' to avoid DLL issues
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Already set, ignore
+        pass
+
 from database import get_db
 from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider, EmbeddingModel, DatabaseConnection, DatabaseSchema
 from config.embedding_models import AVAILABLE_EMBEDDINGS, get_default_embedding_model, get_embedding_model_info, list_embedding_models
@@ -197,6 +209,7 @@ Relationship Type: Foreign Key Constraint
     
     return chunks
 from services.pdf_processor import PDFProcessor
+from services.excel_processor import ExcelProcessor
 from services.embedding_service import EmbeddingService
 from services.chromadb_service import ChromaDBService
 from services.rag_service import RAGService
@@ -224,7 +237,23 @@ app.add_middleware(
 
 # Initialize services
 pdf_processor = PDFProcessor()
-embedding_service = EmbeddingService()
+excel_processor = ExcelProcessor()
+# Embedding service - lazy initialization to avoid DLL issues on Windows
+# Will be initialized when first needed
+embedding_service = None
+def get_embedding_service():
+    """Get or create embedding service instance (lazy initialization)"""
+    global embedding_service
+    if embedding_service is None:
+        try:
+            embedding_service = EmbeddingService()
+        except Exception as e:
+            print(f"[WARNING] Failed to initialize embedding service: {e}")
+            print("[INFO] Embedding features may not work until PyTorch DLL issue is resolved.")
+            # Return a dummy service that will fail gracefully
+            embedding_service = None
+    return embedding_service
+
 chromadb_service = ChromaDBService()
 rag_service = RAGService()
 llm_service = LLMService()
@@ -734,7 +763,10 @@ async def download_embedding_model(model_name: str):
     
     try:
         # Download model
-        result = embedding_service.download_model(model_name)
+        embedding_svc = get_embedding_service()
+        if not embedding_svc:
+            raise HTTPException(status_code=503, detail="Embedding service not available. PyTorch DLL issue may need to be resolved.")
+        result = embedding_svc.download_model(model_name)
         
         if result.get("success"):
             return {
@@ -887,7 +919,10 @@ async def process_pdfs(
 
         # Generate embeddings using selected embedding model
         print(f"[PROCESS] detected_lang={detected_lang}, model={embedding_model_name}, texts={len(all_texts)}")
-        embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+        embedding_svc = get_embedding_service()
+        if not embedding_svc:
+            raise HTTPException(status_code=503, detail="Embedding service not available. PyTorch DLL issue may need to be resolved.")
+        embeddings = embedding_svc.generate_embeddings(all_texts, model_name=embedding_model_name)
         print(f"[PROCESS] embeddings_shape={(len(embeddings) if embeddings is not None else 0)}")
         
         # Add to ChromaDB
@@ -1042,6 +1077,266 @@ async def pdf_chat(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
 
+# Excel Chat Endpoints
+@app.post("/api/excel/upload")
+async def upload_excel(
+    file: UploadFile = File(...),
+    user_id: int = Form(1),  # Default user, should be from auth
+    db: Session = Depends(get_db)
+):
+    """Upload and process Excel file"""
+    try:
+        # Check if file is supported
+        if not excel_processor.is_supported(file.filename):
+            raise HTTPException(status_code=400, detail=f"Unsupported file format. Supported formats: {', '.join(excel_processor.supported_formats)}")
+        
+        # Read file content
+        contents = await file.read()
+        print(f"[EXCEL_UPLOAD] filename={file.filename}, bytes_len={len(contents) if contents else 0}")
+        
+        # Extract data from Excel
+        extraction_result = excel_processor.extract_data_from_excel(contents, file.filename)
+        print(f"[EXCEL_UPLOAD] total_chunks={extraction_result.get('total_chunks')}, sheets={extraction_result.get('metadata',{}).get('total_sheets')}")
+        
+        # Sample text for preview
+        sample_text = "\n\n".join([c.get("text", "") for c in extraction_result.get("chunks", [])[:2]]).strip()
+        
+        # Store file info temporarily (in production, save to storage)
+        response = {
+            "success": True,
+            "filename": file.filename,
+            "chunks": extraction_result["chunks"],
+            "metadata": extraction_result["metadata"],
+            "total_chunks": extraction_result["total_chunks"],
+            "file_type": "excel",
+            "sample_text": sample_text
+        }
+        print(f"[EXCEL_UPLOAD] sample_len={len(sample_text)}")
+        return response
+    except Exception as e:
+        print(f"[EXCEL_UPLOAD][ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process Excel file: {str(e)}")
+
+@app.post("/api/excel/process")
+async def process_excels(
+    session_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Process Excel files and create ChromaDB collection"""
+    try:
+        files = session_data.get("files", [])
+        user_id = session_data.get("user_id", 1)
+        session_id = session_data.get("session_id")
+        embedding_model_name = session_data.get("embedding_model_name", get_default_embedding_model())
+        
+        if not files:
+            raise HTTPException(status_code=400, detail="No files provided")
+        
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        
+        # Get session
+        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get or create embedding model
+        embedding_model = db.query(EmbeddingModel).filter(
+            EmbeddingModel.model_name == embedding_model_name
+        ).first()
+        
+        if not embedding_model:
+            # Create embedding model entry
+            embedding_info = get_embedding_model_info(embedding_model_name)
+            embedding_model = EmbeddingModel(
+                model_name=embedding_model_name,
+                display_name=embedding_info.get("display_name", embedding_model_name),
+                description=embedding_info.get("description", ""),
+                language=embedding_info.get("language", "multilingual"),
+                model_path=embedding_info.get("model_path", embedding_model_name),
+                dimension=embedding_info.get("dimension", 384),
+                is_active=1,
+                is_downloaded=0
+            )
+            db.add(embedding_model)
+            db.commit()
+            db.refresh(embedding_model)
+        
+        # Update session with embedding model
+        session.embedding_model_id = embedding_model.id
+        db.commit()
+        
+        # Collection name
+        collection_name = f"session_{session_id}"
+        
+        # Combine all chunks from all files
+        all_chunks = []
+        for file_data in files:
+            file_chunks = file_data.get("chunks", [])
+            all_chunks.extend(file_chunks)
+        
+        if not all_chunks:
+            raise HTTPException(status_code=400, detail="No data found to vectorize. The Excel file may be empty or corrupted.")
+        
+        # Generate embeddings
+        print(f"[EXCEL_PROCESS] Generating embeddings for {len(all_chunks)} chunks using model: {embedding_model_name}")
+        texts = [chunk["text"] for chunk in all_chunks]
+        embedding_svc = get_embedding_service()
+        if not embedding_svc:
+            raise HTTPException(status_code=503, detail="Embedding service not available. PyTorch DLL issue may need to be resolved.")
+        embeddings = embedding_svc.generate_embeddings(texts, model_name=embedding_model_name)
+        
+        # Prepare metadata
+        metadatas = []
+        ids = []
+        for idx, chunk in enumerate(all_chunks):
+            metadata = chunk.get("metadata", {})
+            metadata["chunk_index"] = idx
+            metadata["session_id"] = session_id
+            metadata["file_type"] = "excel"  # Mark as Excel file type
+            metadatas.append(metadata)
+            ids.append(f"chunk_{session_id}_{idx}")
+        
+        # Create or get collection
+        chromadb_service.create_collection(collection_name, embedding_model_name)
+        
+        # Add to ChromaDB
+        chromadb_service.add_documents(
+            collection_name=collection_name,
+            texts=texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids
+        )
+        
+        # Create a preview summary message
+        preview_text = f"Excel file processed successfully. Found {len(all_chunks)} data chunks across {len(files)} file(s)."
+        if files:
+            first_file_meta = files[0].get("metadata", {})
+            if first_file_meta.get("total_sheets"):
+                preview_text += f" Sheets: {', '.join(first_file_meta.get('sheet_names', []))}"
+        
+        # Save preview message
+        preview_message = ChatMessageModel(
+            session_id=session_id,
+            role="assistant",
+            message=preview_text,
+            created_at=datetime.utcnow()
+        )
+        db.add(preview_message)
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": "Excel files processed and vectorized successfully",
+            "session_id": session_id,
+            "collection_name": collection_name,
+            "total_chunks": len(all_chunks),
+            "preview_message": preview_text
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to process Excel files: {str(e)}")
+
+@app.post("/api/excel/chat")
+async def excel_chat(
+    chat_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Chat with Excel documents using RAG"""
+    try:
+        session_id = chat_data.get("session_id")
+        message = chat_data.get("message")
+        model_id = chat_data.get("model_id")
+        user_id = chat_data.get("user_id", 1)
+        
+        if not session_id or not message:
+            raise HTTPException(status_code=400, detail="session_id and message are required")
+        
+        # Get session
+        session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get model config
+        model = db.query(LLMModel).filter(LLMModel.id == model_id).first()
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found")
+        
+        model_config = {
+            "provider": model.provider.value,
+            "model_name": model.model_name,
+            "base_url": model.base_url
+        }
+        
+        # Get embedding model from session
+        embedding_model = None
+        embedding_model_name = None
+        if session.embedding_model_id:
+            embedding_model = db.query(EmbeddingModel).filter(
+                EmbeddingModel.id == session.embedding_model_id
+            ).first()
+            if embedding_model:
+                embedding_model_name = embedding_model.model_name
+        
+        # Collection name
+        collection_name = f"session_{session_id}"
+        
+        # Check if collection exists before querying
+        try:
+            collections = chromadb_service.list_collections()
+            if collection_name not in collections:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Collection '{collection_name}' does not exist. Please process Excel files first for this session."
+                )
+        except Exception as e:
+            if isinstance(e, HTTPException):
+                raise e
+            # If list_collections fails, try to query anyway (might be a different error)
+            pass
+        
+        # Query using RAG with embedding model
+        rag_result = rag_service.query(
+            query_text=message,
+            collection_name=collection_name,
+            model_config=model_config,
+            embedding_model_name=embedding_model_name,
+            n_results=5
+        )
+        
+        # Save user message
+        user_message = ChatMessageModel(
+            session_id=session_id,
+            role="user",
+            message=message,
+            created_at=datetime.utcnow()
+        )
+        db.add(user_message)
+        
+        # Save assistant message
+        assistant_message = ChatMessageModel(
+            session_id=session_id,
+            role="assistant",
+            message=rag_result["response"],
+            meta_data={"sources": rag_result["sources"]},
+            created_at=datetime.utcnow()
+        )
+        db.add(assistant_message)
+        db.commit()
+        
+        return {
+            "response": rag_result["response"],
+            "sources": rag_result["sources"],
+            "message_id": assistant_message.id,
+            "session_id": session_id
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
 @app.get("/api/sessions")
 async def get_sessions(
     user_id: int = 1,
@@ -1074,7 +1369,7 @@ async def get_sessions(
     
     result = []
     for s in sessions:
-        # Check if this is a database session (has DatabaseSchema) or PDF session
+        # Check if this is a database session (has DatabaseSchema)
         schema = db.query(DatabaseSchema).filter(DatabaseSchema.session_id == s.id).first()
         
         if schema:
@@ -1082,9 +1377,36 @@ async def get_sessions(
             collection_name = f"db_session_{s.id}"
             session_type = "database"
         else:
-            # PDF session - use session_ prefix
+            # Check if this is an Excel session by checking collection metadata
             collection_name = f"session_{s.id}"
-            session_type = "pdf"
+            session_type = "pdf"  # Default to PDF
+            
+            # Check if collection exists and has Excel metadata
+            if collection_name in existing_collections:
+                try:
+                    # Try to get a sample from the collection to check metadata
+                    collection_info = chromadb_service.get_collection_info(collection_name)
+                    # Query a small sample to check metadata
+                    sample_results = chromadb_service.query_collection(
+                        collection_name=collection_name,
+                        query_texts=["sample"],
+                        n_results=1
+                    )
+                    # Check if any metadata indicates Excel file
+                    if sample_results.get("metadatas") and len(sample_results["metadatas"]) > 0:
+                        first_metadata = sample_results["metadatas"][0]
+                        if isinstance(first_metadata, list) and len(first_metadata) > 0:
+                            first_metadata = first_metadata[0]
+                        if isinstance(first_metadata, dict):
+                            # Check for Excel indicators in metadata
+                            if first_metadata.get("file_type") == "excel" or \
+                               "sheet_name" in first_metadata or \
+                               "filename" in first_metadata and any(ext in first_metadata["filename"].lower() for ext in [".xlsx", ".xls", ".xlsm"]):
+                                session_type = "excel"
+                except Exception as e:
+                    # If we can't check, default to PDF
+                    print(f"[SESSIONS] Could not determine session type for {collection_name}: {e}")
+                    pass
         
         has_vectorized_data = collection_name in existing_collections
         
@@ -1467,7 +1789,10 @@ async def process_database_schema(
         
         # Generate embeddings
         all_texts = [chunk['text'] for chunk in chunks]
-        embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+        embedding_svc = get_embedding_service()
+        if not embedding_svc:
+            raise HTTPException(status_code=503, detail="Embedding service not available. PyTorch DLL issue may need to be resolved.")
+        embeddings = embedding_svc.generate_embeddings(all_texts, model_name=embedding_model_name)
         
         # Prepare metadata and IDs
         all_metadatas = []
@@ -1559,10 +1884,12 @@ async def database_chat(
         # Create agent system with model config and services for semantic search
         agent_llm_service = LLMService()
         # Create agent system with model config and embedding/chromadb services
+        # Get embedding service lazily
+        embedding_svc = get_embedding_service()
         db_agent_system = DatabaseAgentSystem(
             agent_llm_service, 
             database_schema_service,
-            embedding_service=embedding_service,
+            embedding_service=embedding_svc,
             chromadb_service=chromadb_service,
             model_config=model_config
         )
@@ -1786,29 +2113,35 @@ async def database_chat(
             
             if chat_texts:
                 # Generate embeddings
-                embeddings = embedding_service.generate_embeddings(
-                    chat_texts, 
-                    model_name=get_default_embedding_model()
-                )
-                
-                # Add to ChromaDB (update collection)
-                try:
-                    # Get existing collection or create
-                    collections = chromadb_service.list_collections()
-                    if collection_name not in collections:
-                        # Create collection if doesn't exist
-                        chromadb_service.create_collection(collection_name)
-                    
-                    # Add messages
-                    chromadb_service.add_documents(
-                        collection_name=collection_name,
-                        texts=chat_texts,
-                        embeddings=embeddings,
-                        metadatas=chat_metadatas,
-                        ids=chat_ids
+                embedding_svc = get_embedding_service()
+                if embedding_svc:
+                    embeddings = embedding_svc.generate_embeddings(
+                        chat_texts, 
+                        model_name=get_default_embedding_model()
                     )
-                except Exception as e:
-                    print(f"[Chat] Error vectorizing chat history: {str(e)}")
+                else:
+                    print("[WARNING] Embedding service not available, skipping chat history vectorization")
+                    embeddings = None
+                
+                if embeddings is not None:
+                    # Add to ChromaDB (update collection)
+                    try:
+                        # Get existing collection or create
+                        collections = chromadb_service.list_collections()
+                        if collection_name not in collections:
+                            # Create collection if doesn't exist
+                            chromadb_service.create_collection(collection_name)
+                        
+                        # Add messages
+                        chromadb_service.add_documents(
+                            collection_name=collection_name,
+                            texts=chat_texts,
+                            embeddings=embeddings,
+                            metadatas=chat_metadatas,
+                            ids=chat_ids
+                        )
+                    except Exception as e:
+                        print(f"[Chat] Error vectorizing chat history: {str(e)}")
         except Exception as e:
             print(f"[Chat] Error in vectorization process: {str(e)}")
         

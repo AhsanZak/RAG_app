@@ -14,9 +14,20 @@ class RAGService:
     """Service for RAG (Retrieval-Augmented Generation)"""
     
     def __init__(self):
-        self.embedding_service = EmbeddingService()
+        # Lazy initialization - don't create embedding service at init
+        # It will be created when first needed
+        self.embedding_service = None
         self.chromadb_service = ChromaDBService()
         self.llm_service = LLMService()
+    
+    def _get_embedding_service(self):
+        """Get or create embedding service (lazy initialization)"""
+        if self.embedding_service is None:
+            try:
+                self.embedding_service = EmbeddingService()
+            except Exception as e:
+                raise Exception(f"Failed to initialize embedding service: {e}")
+        return self.embedding_service
     
     def query(
         self,
@@ -41,7 +52,8 @@ class RAGService:
         """
         try:
             # Generate query embedding using specified model
-            query_embedding = self.embedding_service.generate_embedding(
+            embedding_svc = self._get_embedding_service()
+            query_embedding = embedding_svc.generate_embedding(
                 query_text, 
                 model_name=embedding_model_name
             )

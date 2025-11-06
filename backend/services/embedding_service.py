@@ -4,8 +4,9 @@ Generates embeddings for text using sentence-transformers
 Supports dynamic model loading and switching
 """
 
-from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Optional
+# DO NOT import sentence_transformers at module level - it causes DLL issues on Windows
+# Import will happen lazily when first needed
+from typing import List, Dict, Optional, Any
 import numpy as np
 import os
 import threading
@@ -31,9 +32,26 @@ class EmbeddingService:
             default_model_name: Default model name to use
         """
         self.default_model_name = default_model_name
-        self.loaded_models: Dict[str, SentenceTransformer] = {}
+        self.loaded_models: Dict[str, Any] = {}  # Will hold SentenceTransformer instances
         self.loading_models: Dict[str, threading.Lock] = {}
-        self._load_model(default_model_name)
+        # Don't load model at init - lazy load when first needed to avoid DLL issues
+    
+    def _get_sentence_transformer(self):
+        """Lazy import of SentenceTransformer - only when actually needed"""
+        try:
+            from sentence_transformers import SentenceTransformer
+            return SentenceTransformer
+        except (OSError, ImportError) as e:
+            error_msg = str(e)
+            if "DLL" in error_msg or "dll" in error_msg.lower() or "1114" in error_msg:
+                raise ImportError(
+                    f"PyTorch DLL loading failed: {error_msg}\n"
+                    "Solutions:\n"
+                    "1. Install Microsoft Visual C++ Redistributable 2015-2022\n"
+                    "2. Reinstall PyTorch: pip uninstall torch && pip install torch\n"
+                    "3. Restart your computer after installing redistributables"
+                )
+            raise
     
     def _load_model(self, model_name: str):
         """Load a sentence transformer model"""
@@ -50,6 +68,8 @@ class EmbeddingService:
                 return self.loaded_models[model_name]
             
             try:
+                # Lazy import - only when actually loading a model
+                SentenceTransformer = self._get_sentence_transformer()
                 print(f"Loading embedding model: {model_name}")
                 model = SentenceTransformer(model_name)
                 self.loaded_models[model_name] = model

@@ -3,9 +3,9 @@ ChromaDB Service
 Manages vector storage and retrieval using ChromaDB
 """
 
-import chromadb
-from chromadb.config import Settings
-from typing import List, Dict, Optional
+# Lazy import to avoid DLL issues at module load time
+# chromadb will be imported when first needed
+from typing import List, Dict, Optional, Any
 import numpy as np
 import os
 from pathlib import Path
@@ -24,15 +24,43 @@ class ChromaDBService:
         self.persist_directory = persist_directory
         Path(persist_directory).mkdir(parents=True, exist_ok=True)
         
-        # Initialize ChromaDB client
-        self.client = chromadb.PersistentClient(
-            path=persist_directory,
-            settings=Settings(anonymized_telemetry=False)
-        )
-        
-        print(f"ChromaDB initialized at: {persist_directory}")
+        # Lazy initialization - don't import chromadb at init to avoid DLL issues
+        self.client = None
+        self._chromadb = None
+        self._Settings = None
     
-    def create_collection(self, collection_name: str, metadata: Optional[Dict] = None) -> chromadb.Collection:
+    def _get_chromadb(self):
+        """Lazy import of chromadb - only when actually needed"""
+        if self._chromadb is None:
+            try:
+                import chromadb
+                from chromadb.config import Settings
+                self._chromadb = chromadb
+                self._Settings = Settings
+            except (OSError, ImportError) as e:
+                error_msg = str(e)
+                if "DLL" in error_msg or "dll" in error_msg.lower() or "onnxruntime" in error_msg.lower():
+                    raise ImportError(
+                        f"ChromaDB/ONNX DLL loading failed: {error_msg}\n"
+                        "Solutions:\n"
+                        "1. Install Microsoft Visual C++ Redistributable 2015-2022\n"
+                        "2. Restart your computer after installing redistributables"
+                    )
+                raise
+        return self._chromadb, self._Settings
+    
+    def _ensure_client(self):
+        """Ensure ChromaDB client is initialized"""
+        if self.client is None:
+            chromadb, Settings = self._get_chromadb()
+            # Initialize ChromaDB client
+            self.client = chromadb.PersistentClient(
+                path=self.persist_directory,
+                settings=Settings(anonymized_telemetry=False)
+            )
+            print(f"ChromaDB initialized at: {self.persist_directory}")
+    
+    def create_collection(self, collection_name: str, metadata: Optional[Dict] = None) -> Any:
         """
         Create or get a ChromaDB collection
         
@@ -43,6 +71,7 @@ class ChromaDBService:
         Returns:
             ChromaDB Collection object
         """
+        self._ensure_client()
         try:
             # Try to get existing collection
             collection = self.client.get_collection(name=collection_name)
@@ -141,6 +170,7 @@ class ChromaDBService:
         Returns:
             Dictionary with query results
         """
+        self._ensure_client()
         try:
             collection = self.client.get_collection(name=collection_name)
             
@@ -173,6 +203,7 @@ class ChromaDBService:
     
     def delete_collection(self, collection_name: str):
         """Delete a collection"""
+        self._ensure_client()
         try:
             self.client.delete_collection(name=collection_name)
             print(f"Deleted collection '{collection_name}'")
@@ -181,6 +212,7 @@ class ChromaDBService:
     
     def list_collections(self) -> List[str]:
         """List all collections"""
+        self._ensure_client()
         try:
             collections = self.client.list_collections()
             return [col.name for col in collections]
@@ -189,6 +221,7 @@ class ChromaDBService:
     
     def get_collection_info(self, collection_name: str) -> Dict:
         """Get information about a collection"""
+        self._ensure_client()
         try:
             collection = self.client.get_collection(name=collection_name)
             count = collection.count()

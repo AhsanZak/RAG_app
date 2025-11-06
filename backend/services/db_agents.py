@@ -6,14 +6,19 @@ Multi-agent system for processing database queries:
 3. SQL Validation Agent - Validates and corrects SQL against schema
 """
 
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 import re
 import json
 import numpy as np
 from services.llm_service import LLMService
 from services.database_schema_service import DatabaseSchemaService
-from services.embedding_service import EmbeddingService
 from services.chromadb_service import ChromaDBService
+
+# Lazy import for type hints only
+if TYPE_CHECKING:
+    from services.embedding_service import EmbeddingService
+else:
+    EmbeddingService = Any
 
 
 class IntentDetectionAgent:
