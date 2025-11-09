@@ -234,10 +234,10 @@ sql_execution_service = SQLExecutionService()
 # Verify embedding models configuration on startup
 try:
     from config.embedding_models import AVAILABLE_EMBEDDINGS
-    print(f"✅ Embedding models configuration loaded: {len(AVAILABLE_EMBEDDINGS)} models available")
+    print(f"[OK] Embedding models configuration loaded: {len(AVAILABLE_EMBEDDINGS)} models available")
     print(f"   Models: {', '.join(list(AVAILABLE_EMBEDDINGS.keys())[:5])}...")
 except Exception as e:
-    print(f"❌ Failed to load embedding models configuration: {str(e)}")
+    print(f"[ERROR] Failed to load embedding models configuration: {str(e)}")
     import traceback
     traceback.print_exc()
 
@@ -608,7 +608,7 @@ async def get_embedding_models(language: Optional[str] = None):
         print(f"[DEBUG] Returning {len(result)} models")
         return result
     except Exception as e:
-        print(f"❌ Error getting embedding models: {str(e)}")
+        print(f"[ERROR] Error getting embedding models: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to get embedding models: {str(e)}")
@@ -1082,9 +1082,38 @@ async def get_sessions(
             collection_name = f"db_session_{s.id}"
             session_type = "database"
         else:
-            # PDF session - use session_ prefix
+            # PDF/Excel sessions use session_ prefix
             collection_name = f"session_{s.id}"
             session_type = "pdf"
+            
+            # Try to determine if this session belongs to Excel chat based on metadata
+            if collection_name in existing_collections:
+                try:
+                    sample = chromadb_service.peek_collection(collection_name, n_results=3)
+                    metadata_entries = sample.get("metadatas") or []
+                    
+                    # Flatten metadata lists and keep dicts only
+                    flattened_metadata = []
+                    for item in metadata_entries:
+                        if isinstance(item, dict):
+                            flattened_metadata.append(item)
+                        elif isinstance(item, list):
+                            flattened_metadata.extend([meta for meta in item if isinstance(meta, dict)])
+                    
+                    def is_excel_metadata(meta: Dict) -> bool:
+                        filename = meta.get("filename", "")
+                        sheet_name = meta.get("sheet_name")
+                        file_type = meta.get("file_type")
+                        return (
+                            file_type == "excel"
+                            or bool(sheet_name)
+                            or (isinstance(filename, str) and filename.lower().endswith((".xlsx", ".xls", ".xlsm")))
+                        )
+                    
+                    if any(is_excel_metadata(meta) for meta in flattened_metadata):
+                        session_type = "excel"
+                except Exception as e:
+                    print(f"[SESSIONS] Could not inspect collection '{collection_name}' metadata: {e}")
         
         has_vectorized_data = collection_name in existing_collections
         
@@ -1616,6 +1645,7 @@ async def database_chat(
         # If SQL should be executed
         if agent_result.get('should_execute') and agent_result.get('sql'):
             # Execute SQL
+            print(f"[DEBUG] Executing SQL: {agent_result['sql']}")
             sql_result = sql_execution_service.execute_query(
                 sql=agent_result['sql'],
                 database_type=connection.database_type,
@@ -1627,55 +1657,67 @@ async def database_chat(
                 password=connection.password
             )
             
+            print(f"[DEBUG] SQL execution result - success: {sql_result.get('success')}, row_count: {sql_result.get('row_count', 0)}, has_data: {bool(sql_result.get('data'))}")
+            
             sql_executed = True
             query_result = sql_result
             
             if sql_result.get('success'):
-                # Format SQL results into natural language response
+                # Format SQL results directly - show actual query results
                 try:
                     query_data = sql_result.get('data', [])
                     row_count = sql_result.get('row_count', 0)
+                    columns = sql_result.get('columns', [])
                     
-                    # Only include query results in context if they're not too large
-                    if row_count > 0 and len(query_data) <= 100:  # Limit to 100 rows for context
-                        results_summary = json.dumps(query_data, indent=2, default=str)
-                        context_message = f"SQL Query executed successfully and returned {row_count} rows.\n\nQuery Results:\n{results_summary[:2000]}"  # Limit context size
+                    # Build response with actual query results
+                    if row_count > 0:
+                        # Keep response concise - frontend will display the table
+                        response_text = f"I found **{row_count} result(s)** for your query. The query results are displayed in the table below."
                     else:
-                        context_message = f"SQL Query executed successfully and returned {row_count} rows."
+                        # No results found
+                        response_text = f"I executed your query, but it returned **no results**.\n\n"
+                        if agent_result.get('sql'):
+                            response_text += f"**Executed Query:**\n```sql\n{agent_result['sql']}\n```\n\n"
+                        response_text += "The query completed successfully, but there are no records matching your criteria."
                     
-                    response_text = db_agent_system._generate_chat_response(
-                        user_query=message,
-                        schema_details=schema.schema_data,
-                        schema_text=schema.schema_text or "",
-                        previous_context=previous_context + [
-                            {"role": "assistant", "content": context_message}
-                        ] if previous_context else [
-                            {"role": "assistant", "content": context_message}
-                        ]
-                    )
-                    
-                    # Only include successful query results in metadata
+                    # Store query results in metadata for frontend display
                     if row_count > 0:
                         metadata['query_result'] = {
                             'row_count': row_count,
-                            'columns': sql_result.get('columns', []),
-                            'sample_data': query_data[:10] if len(query_data) <= 100 else []  # First 10 rows, only if not too large
+                            'columns': columns,
+                            'data': query_data[:100] if len(query_data) > 100 else query_data  # Store up to 100 rows
                         }
                     else:
                         metadata['query_result'] = {
                             'row_count': 0,
-                            'columns': sql_result.get('columns', []),
-                            'message': 'Query executed successfully but returned no rows.'
+                            'columns': columns,
+                            'data': []
                         }
                 except Exception as e:
-                    # If formatting fails, provide a simple response
+                    # If formatting fails, provide a simple response with data
                     import logging
                     logging.error(f"Error formatting SQL results: {str(e)}")
                     row_count = sql_result.get('row_count', 0)
+                    query_data = sql_result.get('data', [])
+                    columns = sql_result.get('columns', [])
+                    
                     if row_count > 0:
-                        response_text = f"I successfully executed your query and found {row_count} result(s)."
+                        response_text = f"I successfully executed your query and found **{row_count} result(s)**.\n\n"
+                        if agent_result.get('sql'):
+                            response_text += f"**Executed Query:**\n```sql\n{agent_result['sql']}\n```\n\n"
+                        # Include raw data even if formatting failed
+                        response_text += "**Query Results:**\n```json\n" + json.dumps(query_data[:10], indent=2, default=str) + "\n```"
                     else:
-                        response_text = "I executed your query successfully, but it returned no results."
+                        response_text = "I executed your query successfully, but it returned **no results**.\n\n"
+                        if agent_result.get('sql'):
+                            response_text += f"**Executed Query:**\n```sql\n{agent_result['sql']}\n```"
+                    
+                    # Still store results in metadata
+                    metadata['query_result'] = {
+                        'row_count': row_count,
+                        'columns': columns,
+                        'data': query_data[:100] if len(query_data) > 100 else query_data
+                    }
             else:
                 # SQL execution failed - provide user-friendly error message
                 error_msg = sql_result.get('error', 'Unknown error occurred')
@@ -1816,17 +1858,48 @@ async def database_chat(
         # Only include SQL in response if execution was successful
         if sql_executed and query_result and query_result.get('success'):
             response_data["sql"] = agent_result.get('sql')
-            if query_result.get('data'):
-                response_data["query_result"] = query_result.get('data', [])[:10]  # Limit to 10 rows
+            # Get query data - check if it exists and is not None
+            query_data = query_result.get('data')
+            row_count = query_result.get('row_count', 0)
+            columns = query_result.get('columns', [])
+            
+            # Debug logging
+            print(f"[DEBUG] SQL executed successfully. Row count: {row_count}, Data type: {type(query_data)}, Data length: {len(query_data) if query_data else 0}")
+            if query_data and len(query_data) > 0:
+                print(f"[DEBUG] First row sample: {query_data[0] if query_data else 'None'}")
+            
+            # Always include query_result in response when SQL executes successfully
+            if query_data is not None:
+                # Return all data (up to 100 rows for display, frontend can paginate)
+                response_data["query_result"] = query_data[:100] if len(query_data) > 100 else query_data
+                response_data["query_result_count"] = row_count
+                # Extract columns from data if not provided
+                if columns and len(columns) > 0:
+                    response_data["query_result_columns"] = columns
+                elif query_data and len(query_data) > 0 and isinstance(query_data[0], dict):
+                    response_data["query_result_columns"] = list(query_data[0].keys())
+                else:
+                    response_data["query_result_columns"] = []
             else:
+                # No data returned, but query was successful (e.g., INSERT/UPDATE/DELETE)
                 response_data["query_result"] = []
+                response_data["query_result_count"] = row_count
+                response_data["query_result_columns"] = columns if columns else []
+            
+            print(f"[DEBUG] Response includes query_result: {len(response_data.get('query_result', []))} rows")
         elif agent_result.get('sql') and not sql_executed:
             # SQL was generated but not executed (validation failed)
             # Don't expose the SQL to frontend
             response_data["sql"] = None
+            response_data["query_result"] = []
+            response_data["query_result_count"] = 0
+            response_data["query_result_columns"] = []
         else:
             # No SQL generated or errors occurred
             response_data["sql"] = None
+            response_data["query_result"] = []
+            response_data["query_result_count"] = 0
+            response_data["query_result_columns"] = []
         
         return response_data
     except HTTPException:

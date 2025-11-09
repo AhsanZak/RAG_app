@@ -3,11 +3,8 @@ ChromaDB Service
 Manages vector storage and retrieval using ChromaDB
 """
 
-import chromadb
-from chromadb.config import Settings
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import numpy as np
-import os
 from pathlib import Path
 
 
@@ -24,15 +21,52 @@ class ChromaDBService:
         self.persist_directory = persist_directory
         Path(persist_directory).mkdir(parents=True, exist_ok=True)
         
-        # Initialize ChromaDB client
-        self.client = chromadb.PersistentClient(
-            path=persist_directory,
-            settings=Settings(anonymized_telemetry=False)
-        )
+        self.client = None
+        self._chromadb = None
+        self._Settings = None
         
         print(f"ChromaDB initialized at: {persist_directory}")
     
-    def create_collection(self, collection_name: str, metadata: Optional[Dict] = None) -> chromadb.Collection:
+    def _get_chromadb(self):
+        """Lazy import of chromadb - only when actually needed"""
+        if self._chromadb is None:
+            try:
+                import importlib
+                # Patch default embedding function BEFORE chromadb initializes collections
+                embedding_functions = importlib.import_module("chromadb.utils.embedding_functions")
+                if not getattr(embedding_functions, "_patched_default", False):
+                    def _noop_default_embedding_function():
+                        return None
+                    embedding_functions.DefaultEmbeddingFunction = _noop_default_embedding_function
+                    embedding_functions._patched_default = True
+                
+                chromadb = importlib.import_module("chromadb")
+                config_module = importlib.import_module("chromadb.config")
+                Settings = getattr(config_module, "Settings")
+                self._chromadb = chromadb
+                self._Settings = Settings
+            except (OSError, ImportError, ValueError) as e:
+                error_msg = str(e)
+                if "onnxruntime" in error_msg.lower():
+                    raise ImportError(
+                        "ChromaDB attempted to load ONNX runtime. "
+                        "To avoid this dependency, ensure you are using the latest code where "
+                        "ChromaDB collections are created with embedding_function=None and "
+                        "delete existing persisted collections under 'chroma_db/'."
+                    ) from e
+                raise
+        return self._chromadb, self._Settings
+    
+    def _ensure_client(self):
+        """Ensure ChromaDB client is initialized"""
+        if self.client is None:
+            chromadb, Settings = self._get_chromadb()
+            self.client = chromadb.PersistentClient(
+                path=self.persist_directory,
+                settings=Settings(anonymized_telemetry=False)
+            )
+    
+    def create_collection(self, collection_name: str, metadata: Optional[Dict] = None) -> Any:
         """
         Create or get a ChromaDB collection
         
@@ -43,6 +77,7 @@ class ChromaDBService:
         Returns:
             ChromaDB Collection object
         """
+        self._ensure_client()
         try:
             # Try to get existing collection
             collection = self.client.get_collection(name=collection_name)
@@ -54,7 +89,8 @@ class ChromaDBService:
             collection_metadata = metadata if metadata and len(metadata) > 0 else None
             collection = self.client.create_collection(
                 name=collection_name,
-                metadata=collection_metadata
+                metadata=collection_metadata,
+                embedding_function=None
             )
             print(f"Created new collection '{collection_name}'")
             return collection
@@ -141,6 +177,7 @@ class ChromaDBService:
         Returns:
             Dictionary with query results
         """
+        self._ensure_client()
         try:
             collection = self.client.get_collection(name=collection_name)
             
@@ -173,6 +210,7 @@ class ChromaDBService:
     
     def delete_collection(self, collection_name: str):
         """Delete a collection"""
+        self._ensure_client()
         try:
             self.client.delete_collection(name=collection_name)
             print(f"Deleted collection '{collection_name}'")
@@ -181,6 +219,7 @@ class ChromaDBService:
     
     def list_collections(self) -> List[str]:
         """List all collections"""
+        self._ensure_client()
         try:
             collections = self.client.list_collections()
             return [col.name for col in collections]
@@ -189,6 +228,7 @@ class ChromaDBService:
     
     def get_collection_info(self, collection_name: str) -> Dict:
         """Get information about a collection"""
+        self._ensure_client()
         try:
             collection = self.client.get_collection(name=collection_name)
             count = collection.count()
@@ -198,4 +238,23 @@ class ChromaDBService:
             }
         except Exception as e:
             raise Exception(f"Failed to get collection info: {str(e)}")
+
+    def peek_collection(self, collection_name: str, n_results: int = 1) -> Dict:
+        """
+        Retrieve a small sample of documents from a collection.
+
+        Args:
+            collection_name: Name of the collection
+            n_results: Number of documents to retrieve (default 1)
+
+        Returns:
+            Dictionary with ids, documents, metadata, and embeddings (if available)
+        """
+        self._ensure_client()
+        try:
+            collection = self.client.get_collection(name=collection_name)
+            sample = collection.get(limit=n_results)
+            return sample
+        except Exception as e:
+            raise Exception(f"Failed to peek into collection '{collection_name}': {str(e)}")
 
