@@ -190,3 +190,29 @@ class DatabaseSchema(Base):
     
     def __repr__(self):
         return f"<DatabaseSchema(id={self.id}, connection_id={self.connection_id})>"
+
+
+class DatabaseKnowledge(Base):
+    """Model for storing additional knowledge documents for database chat"""
+    __tablename__ = "database_knowledge"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    connection_id = Column(Integer, ForeignKey("database_connections.id"), nullable=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(255))
+    description = Column(Text)
+    original_filename = Column(String(255))
+    file_path = Column(String(500), nullable=False)
+    file_type = Column(String(100))
+    content_type = Column(String(100))
+    tags = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    connection = relationship("DatabaseConnection")
+    session = relationship("ChatSession")
+    user = relationship("User")
+    
+    def __repr__(self):
+        return f"<DatabaseKnowledge(id={self.id}, connection_id={self.connection_id}, filename='{self.original_filename}')>"

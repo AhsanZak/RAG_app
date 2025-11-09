@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Layout,
   Button,
@@ -15,7 +15,9 @@ import {
   Form,
   message,
   Tabs,
-  Descriptions
+  Upload,
+  Spin,
+  Tooltip
 } from 'antd';
 import {
   DatabaseOutlined,
@@ -30,7 +32,8 @@ import {
   SyncOutlined,
   FileTextOutlined,
   DownloadOutlined,
-  EditOutlined
+  EditOutlined,
+  UploadOutlined
 } from '@ant-design/icons';
 import Markdown from 'react-markdown';
 import { llmModelsAPI, databaseChatAPI, embeddingModelsAPI } from '../services/api';
@@ -69,6 +72,65 @@ const DatabaseChat = ({ onBack }) => {
   const [schemaModalSaving, setSchemaModalSaving] = useState(false);
   const [schemaModalError, setSchemaModalError] = useState(null);
   const [schemaModalTab, setSchemaModalTab] = useState('structured');
+  const [knowledgeItems, setKnowledgeItems] = useState([]);
+  const [knowledgeLoading, setKnowledgeLoading] = useState(false);
+  const [knowledgeTitle, setKnowledgeTitle] = useState('');
+  const [knowledgeDescription, setKnowledgeDescription] = useState('');
+  const [knowledgeFileList, setKnowledgeFileList] = useState([]);
+  const [knowledgeUploading, setKnowledgeUploading] = useState(false);
+  const [activeTab, setActiveTab] = useState('chat');
+  const { Dragger } = Upload;
+
+  const formatRelativeTime = useMemo(() => {
+    const divisions = [
+      { amount: 60, name: 'seconds' },
+      { amount: 60, name: 'minutes' },
+      { amount: 24, name: 'hours' },
+      { amount: 7, name: 'days' },
+      { amount: 4.34524, name: 'weeks' },
+      { amount: 12, name: 'months' },
+      { amount: Number.POSITIVE_INFINITY, name: 'years' },
+    ];
+
+    const rtf = typeof Intl !== 'undefined' && Intl.RelativeTimeFormat
+      ? new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
+      : null;
+
+    return (value) => {
+      if (!value) return 'Unknown time';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return typeof value === 'string' ? value : 'Unknown time';
+      }
+
+      const now = new Date();
+      let duration = (date.getTime() - now.getTime()) / 1000;
+
+      for (const division of divisions) {
+        if (Math.abs(duration) < division.amount) {
+          if (rtf) {
+            return rtf.format(Math.round(duration), division.name);
+          }
+          // Fallback text if Intl.RelativeTimeFormat unavailable
+          const rounded = Math.round(Math.abs(duration));
+          const unit = division.name.replace(/s$/, '');
+          return duration <= 0
+            ? `${rounded} ${unit}${rounded !== 1 ? 's' : ''} ago`
+            : `in ${rounded} ${unit}${rounded !== 1 ? 's' : ''}`;
+        }
+        duration /= division.amount;
+      }
+
+      return date.toLocaleString();
+    };
+  }, []);
+
+  const selectedModelLabel = useMemo(() => {
+    if (!selectedModel) return null;
+    const found = availableModels.find((model) => model.id === selectedModel);
+    if (!found) return null;
+    return found.display_name || found.name || found.model_name || found.id;
+  }, [availableModels, selectedModel]);
 
   // Default ports for different database types
   const defaultPorts = {
@@ -90,6 +152,18 @@ const DatabaseChat = ({ onBack }) => {
   useEffect(() => {
     scrollToBottom();
   }, [chatMessages]);
+
+  useEffect(() => {
+    if (currentConnection && currentConnection.id) {
+      loadKnowledge(currentConnection.id);
+    } else {
+      setKnowledgeItems([]);
+      setKnowledgeTitle('');
+      setKnowledgeDescription('');
+      setKnowledgeFileList([]);
+      setActiveTab('chat');
+    }
+  }, [currentConnection]);
 
   const loadModels = async () => {
     try {
@@ -289,6 +363,9 @@ const DatabaseChat = ({ onBack }) => {
       // Filter for database sessions only
       const dbSessions = sessionsData.filter(s => s.session_type === 'database');
       setSessions(dbSessions);
+      if (connectionId) {
+        loadKnowledge(connectionId);
+      }
       
       // If there's a current session and it's in the list, keep it selected
       // Otherwise, select the most recent session
@@ -317,6 +394,71 @@ const DatabaseChat = ({ onBack }) => {
     }
   };
 
+  const loadKnowledge = async (connectionId) => {
+    if (!connectionId) return;
+    setKnowledgeLoading(true);
+    try {
+      const data = await databaseChatAPI.getKnowledge(connectionId);
+      setKnowledgeItems(data || []);
+    } catch (error) {
+      console.error('Error loading knowledge documents:', error);
+      message.error('Failed to load knowledge documents');
+      setKnowledgeItems([]);
+    } finally {
+      setKnowledgeLoading(false);
+    }
+  };
+
+  const handleConfirmKnowledgeUpload = async () => {
+    if (!currentConnection) {
+      message.warning('Select a database connection first');
+      return;
+    }
+    if (!knowledgeFileList.length) {
+      message.info('Choose a knowledge document to upload');
+      return;
+    }
+
+    const uploadFile = knowledgeFileList[0].originFileObj || knowledgeFileList[0];
+    setKnowledgeUploading(true);
+    try {
+      await databaseChatAPI.uploadKnowledge({
+        connectionId: currentConnection.id,
+        sessionId: currentSession?.id,
+        title: knowledgeTitle,
+        description: knowledgeDescription,
+        file: uploadFile,
+      });
+      message.success('Knowledge document uploaded');
+      setKnowledgeTitle('');
+      setKnowledgeDescription('');
+      setKnowledgeFileList([]);
+      await loadKnowledge(currentConnection.id);
+    } catch (error) {
+      console.error('Failed to upload knowledge document:', error);
+      message.error(error.response?.data?.detail || 'Failed to upload knowledge document');
+    } finally {
+      setKnowledgeUploading(false);
+    }
+  };
+
+  const handleDeleteKnowledge = async (item) => {
+    if (!currentConnection) return;
+    try {
+      await databaseChatAPI.deleteKnowledge(item.id);
+      message.success('Knowledge document deleted');
+      await loadKnowledge(currentConnection.id);
+    } catch (error) {
+      console.error('Failed to delete knowledge document:', error);
+      message.error('Failed to delete knowledge document');
+    }
+  };
+
+  const handleDownloadKnowledge = (item) => {
+    const url = databaseChatAPI.getKnowledgeDownloadUrl(item.id);
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
+
   const handleSelectSession = async (session) => {
     setCurrentSession(session);
     setSessionReady(session.hasVectorizedData || false);
@@ -324,13 +466,35 @@ const DatabaseChat = ({ onBack }) => {
     try {
       // Load messages for this session
       const messagesData = await databaseChatAPI.getSessionMessages(session.id);
-      const formattedMessages = messagesData.map(msg => ({
-        id: msg.id,
-        role: msg.role,
-        content: msg.message || msg.content,
-        timestamp: new Date(msg.created_at),
-        metadata: msg.metadata || {}
-      }));
+      const formattedMessages = messagesData.map((msg) => {
+        const metadata = msg.metadata || {};
+        const queryMeta = metadata.query_result || {};
+        const queryData = Array.isArray(queryMeta.data) ? queryMeta.data : [];
+        const queryColumns =
+          Array.isArray(queryMeta.columns) && queryMeta.columns.length > 0
+            ? queryMeta.columns
+            : (queryData.length > 0 && typeof queryData[0] === 'object'
+                ? Object.keys(queryData[0])
+                : []);
+        const rowCount = typeof queryMeta.row_count === 'number'
+          ? queryMeta.row_count
+          : queryData.length;
+        const sql = metadata.sql;
+        const sqlExecuted = Boolean(sql) && (rowCount > 0 || queryData.length > 0);
+
+        return {
+          id: msg.id,
+          role: msg.role,
+          content: msg.message || msg.content,
+          timestamp: new Date(msg.created_at),
+          metadata,
+          sql,
+          sqlExecuted,
+          queryResult: queryData,
+          queryResultCount: rowCount,
+          queryResultColumns: queryColumns,
+        };
+      });
       setChatMessages(formattedMessages);
     } catch (error) {
       console.error('Error loading session messages:', error);
@@ -343,6 +507,10 @@ const DatabaseChat = ({ onBack }) => {
     setChatMessages([]);
     setSessionReady(false);
     setCurrentSession(null);
+    setKnowledgeItems([]);
+    setKnowledgeTitle('');
+    setKnowledgeDescription('');
+    setActiveTab('chat');
     
     // Try to load existing schema
     try {
@@ -363,6 +531,8 @@ const DatabaseChat = ({ onBack }) => {
       setSchemaData(null);
       setSessions([]);
     }
+    
+    await loadKnowledge(connection.id);
   };
 
   const handleExtractSchema = async () => {
@@ -657,8 +827,358 @@ const DatabaseChat = ({ onBack }) => {
     }
   };
 
+  const knowledgeUploadProps = {
+    accept: '.pdf,.json,.txt,.md,.csv,.yaml,.yml,.sql',
+    multiple: false,
+    maxCount: 1,
+    fileList: knowledgeFileList,
+    beforeUpload: (file) => {
+      if (!currentConnection) {
+        message.warning('Select a database connection first');
+        return Upload.LIST_IGNORE;
+      }
+      const maxBytes = 10 * 1024 * 1024;
+      if (file.size && file.size > maxBytes) {
+        message.error('File size must be 10MB or less');
+        return Upload.LIST_IGNORE;
+      }
+      setKnowledgeFileList([file]);
+      return false; // prevent auto upload
+    },
+    onChange: (info) => {
+      setKnowledgeFileList(info.fileList.slice(-1));
+    },
+    onRemove: () => {
+      setKnowledgeFileList([]);
+    },
+  };
+
+  const renderKnowledgeTab = () => {
+    if (!currentConnection) {
+      return (
+        <Alert
+          message="Select a connection"
+          description="Choose a database connection to upload schema helpers or query examples."
+          type="info"
+          showIcon
+        />
+      );
+    }
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16, height: '100%', minHeight: 0, overflow: 'hidden' }}>
+        <Card
+          title="Upload Knowledge Document"
+          extra={
+            <Tag color="purple">
+              Embedding: {selectedEmbeddingModelName || 'Not selected'}
+            </Tag>
+          }
+          bodyStyle={{ display: 'flex', flexDirection: 'column', gap: 16 }}
+        >
+          <Input
+            placeholder="Title (optional)"
+            value={knowledgeTitle}
+            onChange={(e) => setKnowledgeTitle(e.target.value)}
+          />
+          <Input.TextArea
+            rows={3}
+            placeholder="Description or purpose (optional)"
+            value={knowledgeDescription}
+            onChange={(e) => setKnowledgeDescription(e.target.value)}
+          />
+          <Dragger {...knowledgeUploadProps} style={{ padding: 16 }}>
+            <p className="ant-upload-drag-icon">
+              <DatabaseOutlined style={{ color: '#722ed1' }} />
+            </p>
+            <p className="ant-upload-text">Click or drag files to this area</p>
+            <p className="ant-upload-hint">
+              Supported formats: PDF, JSON, TXT, Markdown, CSV, YAML, SQL (max 10MB)
+            </p>
+          </Dragger>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Typography.Text type="secondary">
+              {knowledgeFileList.length > 0
+                ? `Selected: ${knowledgeFileList[0].name}`
+                : 'No file selected'}
+            </Typography.Text>
+            <Space>
+              {knowledgeFileList.length > 0 && (
+                <Button onClick={() => setKnowledgeFileList([])}>Clear</Button>
+              )}
+              <Button
+                type="primary"
+                icon={<UploadOutlined />}
+                onClick={handleConfirmKnowledgeUpload}
+                disabled={!knowledgeFileList.length}
+                loading={knowledgeUploading}
+              >
+                Upload
+              </Button>
+            </Space>
+          </div>
+        </Card>
+
+        <Card
+          title="Knowledge Library"
+          bodyStyle={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}
+          style={{ flex: 1, minHeight: 0 }}
+        >
+          <Spin spinning={knowledgeLoading} style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+            <List
+              dataSource={knowledgeItems}
+              locale={{ emptyText: 'No knowledge documents uploaded yet.' }}
+              style={{ flex: 1, maxHeight: '100%', overflowY: 'auto' }}
+              renderItem={(item) => (
+                <List.Item
+                  key={item.id}
+                  style={{ paddingInline: 24 }}
+                  actions={[
+                    <Tooltip title="Download" key="download">
+                      <Button
+                        type="link"
+                        icon={<DownloadOutlined />}
+                        onClick={() => handleDownloadKnowledge(item)}
+                      />
+                    </Tooltip>,
+                    <Tooltip title="Delete" key="delete">
+                      <Button
+                        type="link"
+                        danger
+                        icon={<DeleteOutlined />}
+                        onClick={() => handleDeleteKnowledge(item)}
+                      />
+                    </Tooltip>,
+                  ]}
+                >
+                  <List.Item.Meta
+                    title={
+                      <Space wrap>
+                        <FileTextOutlined />
+                        <Typography.Text strong>
+                          {item.title || item.original_filename || 'Untitled document'}
+                        </Typography.Text>
+                        {item.file_type && <Tag color="geekblue">{item.file_type.toUpperCase()}</Tag>}
+                        {item.embedding_model && (
+                          <Tag color="cyan">{item.embedding_model}</Tag>
+                        )}
+                      </Space>
+                    }
+                    description={
+                      <Space direction="vertical" size="small">
+                        <Typography.Text>
+                          {item.description || 'No description provided.'}
+                        </Typography.Text>
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          {item.original_filename || 'Unknown file'} • {item.file_type?.toUpperCase() || 'FILE'} • Uploaded{' '}
+                          {item.created_at_human || formatRelativeTime(item.created_at)}
+                        </Typography.Text>
+                      </Space>
+                    }
+                  />
+                </List.Item>
+              )}
+            />
+          </Spin>
+        </Card>
+      </div>
+    );
+  };
+
+  const renderChatTab = () => {
+    if (!currentConnection) {
+      return (
+        <div className="empty-chat-state">
+          <DatabaseOutlined style={{ fontSize: '64px', color: '#d9d9d9', marginBottom: 16 }} />
+          <Title level={3}>Select a Connection</Title>
+          <Paragraph>
+            Select a database connection from the left panel to start chatting with your database schema.
+          </Paragraph>
+        </div>
+      );
+    }
+
+    if (!schemaData) {
+      return (
+        <div className="empty-chat-state">
+          <SyncOutlined style={{ fontSize: '64px', color: '#d9d9d9', marginBottom: 16 }} />
+          <Title level={3}>Extract Schema</Title>
+          <Paragraph>
+            Click "Extract Schema" in the left panel to extract and analyze your database schema.
+          </Paragraph>
+        </div>
+      );
+    }
+
+    if (!sessionReady) {
+      return (
+        <div className="empty-chat-state">
+          <RobotOutlined style={{ fontSize: '64px', color: '#d9d9d9', marginBottom: 16 }} />
+          <Title level={3}>Process Schema</Title>
+          <Paragraph>
+            Click "Process & Vectorize Schema" in the left panel to enable chat functionality.
+          </Paragraph>
+        </div>
+      );
+    }
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+        <Space size={[8, 8]} wrap style={{ marginBottom: 16 }}>
+          <Tag color="purple">
+            Embedding: {selectedEmbeddingModelName || 'Not selected'}
+          </Tag>
+          {selectedModelLabel && (
+            <Tag color="geekblue">
+              LLM: {selectedModelLabel}
+            </Tag>
+          )}
+        </Space>
+
+        <div
+          className="chat-messages-container"
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflowY: 'auto',
+            paddingRight: 8,
+            marginBottom: 16,
+          }}
+        >
+          {chatMessages.length === 0 ? (
+            <div className="empty-messages-state">
+              <RobotOutlined style={{ fontSize: '48px', color: '#d9d9d9', marginBottom: 16 }} />
+              <Title level={4}>Start Chatting</Title>
+              <Paragraph>
+                Ask questions about your database schema. The AI will use the vectorized schema
+                information to provide accurate answers.
+              </Paragraph>
+            </div>
+          ) : (
+            <div className="messages-list">
+              {chatMessages.map((message) => (
+                <div
+                  key={message.id}
+                  className={`message-item ${message.role === 'user' ? 'user-message' : 'assistant-message'}`}
+                >
+                  <div className="message-avatar">
+                    {message.role === 'user' ? <UserOutlined /> : <RobotOutlined />}
+                  </div>
+                  <div className="message-content">
+                    <div className="message-bubble">
+                      <Markdown>{message.content}</Markdown>
+                      
+                      {message.sql && (
+                        <div style={{ marginTop: 12, padding: 8, background: '#f5f5f5', borderRadius: 4 }}>
+                          <Text strong style={{ fontSize: '12px' }}>SQL Query:</Text>
+                          <pre style={{ marginTop: 4, fontSize: '11px', whiteSpace: 'pre-wrap' }}>
+                            {message.sql}
+                          </pre>
+                        </div>
+                      )}
+                      
+                      {message.sqlExecuted && Array.isArray(message.queryResult) && message.queryResult.length > 0 && (
+                        <div style={{ marginTop: 12 }}>
+                          <Text strong style={{ fontSize: '12px' }}>
+                            Query Results {message.queryResultCount && message.queryResultCount !== message.queryResult.length 
+                              ? `(${message.queryResultCount} total, showing ${message.queryResult.length})` 
+                              : `(${message.queryResult.length} ${message.queryResult.length === 1 ? 'row' : 'rows'})`}:
+                          </Text>
+                          <div style={{ marginTop: 8, maxHeight: '500px', overflow: 'auto', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' }}>
+                            <table style={{ width: '100%', fontSize: '12px', borderCollapse: 'collapse' }}>
+                              <thead>
+                                <tr style={{ background: '#f0f0f0', position: 'sticky', top: 0, zIndex: 1 }}>
+                                  {(Array.isArray(message.queryResultColumns) && message.queryResultColumns.length > 0
+                                    ? message.queryResultColumns
+                                    : Object.keys(message.queryResult[0] || {})
+                                  ).map((key) => (
+                                    <th key={key} style={{ padding: '8px', textAlign: 'left', border: '1px solid #ddd', fontWeight: 'bold' }}>
+                                      {key}
+                                    </th>
+                                  ))}
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {message.queryResult.map((row, idx) => (
+                                  <tr key={idx} style={{ background: idx % 2 === 0 ? '#fff' : '#fafafa' }}>
+                                    {(Array.isArray(message.queryResultColumns) && message.queryResultColumns.length > 0
+                                      ? message.queryResultColumns
+                                      : Object.keys(message.queryResult[0] || {})
+                                    ).map((col, colIdx) => (
+                                      <td key={colIdx} style={{ padding: '6px 8px', border: '1px solid #ddd', wordBreak: 'break-word' }}>
+                                        {String(row && row[col] !== null && row[col] !== undefined ? row[col] : '')}
+                                      </td>
+                                    ))}
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                            {message.queryResultCount && message.queryResultCount > message.queryResult.length && (
+                              <div style={{ padding: '8px', background: '#f9f9f9', borderTop: '1px solid #ddd', textAlign: 'center' }}>
+                                <Text type="secondary" style={{ fontSize: '11px' }}>
+                                  Showing {message.queryResult.length} of {message.queryResultCount} rows
+                                </Text>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    {message.metadata?.debug_messages && Array.isArray(message.metadata.debug_messages) && (
+                      <div style={{ marginTop: 8, fontSize: '11px', color: '#999' }}>
+                        {message.metadata.debug_messages.join(' | ')}
+                      </div>
+                    )}
+                    <div className="message-timestamp">
+                      {message.timestamp.toLocaleTimeString()}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              <div ref={messagesEndRef} />
+            </div>
+          )}
+        </div>
+
+        <Footer
+          className="chat-input-footer"
+          style={{ padding: '12px 0', background: 'transparent' }}
+        >
+          <div className="input-container">
+            <Input.TextArea
+              ref={inputRef}
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              onKeyPress={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSendMessage();
+                }
+              }}
+              placeholder="Ask questions about your database schema..."
+              autoSize={{ minRows: 1, maxRows: 4 }}
+              className="chat-input"
+            />
+            <Button
+              type="primary"
+              icon={<SendOutlined />}
+              onClick={handleSendMessage}
+              disabled={!inputValue.trim() || !sessionReady}
+              className="send-btn"
+            >
+              Send
+            </Button>
+          </div>
+        </Footer>
+      </div>
+    );
+  };
+
   return (
-    <Layout className="pdf-chat-layout">
+    <Layout
+      className="pdf-chat-layout"
+      style={{ height: '100vh', overflow: 'hidden' }}
+    >
       <Header className="pdf-chat-header">
         <Space>
           <Button type="text" onClick={onBack}>
@@ -685,10 +1205,19 @@ const DatabaseChat = ({ onBack }) => {
         </Space>
       </Header>
 
-      <Content className="pdf-chat-content">
-        <div className="pdf-chat-container">
+      <Content
+        className="pdf-chat-content"
+        style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}
+      >
+        <div
+          className="pdf-chat-container"
+          style={{ flex: 1, display: 'flex', gap: 24, height: '100%', overflow: 'hidden' }}
+        >
           {/* Left Panel - Connections & Schema */}
-          <div className="pdf-chat-sidebar">
+          <div
+            className="pdf-chat-sidebar"
+            style={{ width: 360, minWidth: 320, maxWidth: 420, overflowY: 'auto', paddingRight: 8 }}
+          >
             <Card 
               className="sidebar-upload"
               size="small"
@@ -885,186 +1414,26 @@ const DatabaseChat = ({ onBack }) => {
           </div>
 
           {/* Right Panel - Chat Area */}
-          <div className="pdf-chat-main">
-            {!currentConnection ? (
-              <div className="empty-chat-state">
-                <DatabaseOutlined style={{ fontSize: '64px', color: '#d9d9d9', marginBottom: 16 }} />
-                <Title level={3}>Select a Connection</Title>
-                <Paragraph>
-                  Select a database connection from the left panel to start chatting with your database schema.
-                </Paragraph>
-              </div>
-            ) : !schemaData ? (
-              <div className="empty-chat-state">
-                <SyncOutlined style={{ fontSize: '64px', color: '#d9d9d9', marginBottom: 16 }} />
-                <Title level={3}>Extract Schema</Title>
-                <Paragraph>
-                  Click "Extract Schema" in the left panel to extract and analyze your database schema.
-                </Paragraph>
-              </div>
-            ) : !sessionReady ? (
-              <div className="empty-chat-state">
-                <RobotOutlined style={{ fontSize: '64px', color: '#d9d9d9', marginBottom: 16 }} />
-                <Title level={3}>Process Schema</Title>
-                <Paragraph>
-                  Click "Process & Vectorize Schema" in the left panel to enable chat functionality.
-                </Paragraph>
-              </div>
-            ) : (
-              <>
-                <div className="chat-messages-container">
-                  {chatMessages.length === 0 ? (
-                    <div className="empty-messages-state">
-                      <RobotOutlined style={{ fontSize: '48px', color: '#d9d9d9', marginBottom: 16 }} />
-                      <Title level={4}>Start Chatting</Title>
-                      <Paragraph>
-                        Ask questions about your database schema. The AI will use the vectorized schema
-                        information to provide accurate answers.
-                      </Paragraph>
-                    </div>
-                  ) : (
-                    <div className="messages-list">
-                      {chatMessages.map((message) => (
-                        <div
-                          key={message.id}
-                          className={`message-item ${message.role === 'user' ? 'user-message' : 'assistant-message'}`}
-                        >
-                          <div className="message-avatar">
-                            {message.role === 'user' ? (
-                              <UserOutlined />
-                            ) : (
-                              <RobotOutlined />
-                            )}
-                          </div>
-                          <div className="message-content">
-                            <div className="message-bubble">
-                              <Markdown>{message.content}</Markdown>
-                              
-                              {/* Debug info - remove in production */}
-                              {process.env.NODE_ENV === 'development' && message.sqlExecuted && (
-                                <div style={{ marginTop: 8, padding: 4, background: '#fff3cd', borderRadius: 4, fontSize: '10px' }}>
-                                  <strong>Debug:</strong> sqlExecuted={String(message.sqlExecuted)}, 
-                                  hasQueryResult={String(!!message.queryResult)}, 
-                                  queryResultLength={message.queryResult?.length || 0},
-                                  queryResultType={typeof message.queryResult}
-                                </div>
-                              )}
-                              
-                              {/* Show SQL query if executed */}
-                              {message.sql && message.sqlExecuted && (
-                                <div style={{ marginTop: 12, padding: 8, background: '#f5f5f5', borderRadius: 4 }}>
-                                  <Text strong style={{ fontSize: '12px' }}>SQL Query:</Text>
-                                  <pre style={{ marginTop: 4, fontSize: '11px', whiteSpace: 'pre-wrap' }}>
-                                    {message.sql}
-                                  </pre>
-                                </div>
-                              )}
-                              
-                              {/* Show query results if available */}
-                              {message.sqlExecuted && message.sql && message.queryResult && Array.isArray(message.queryResult) && message.queryResult.length > 0 ? (
-                                <div style={{ marginTop: 12 }}>
-                                  <Text strong style={{ fontSize: '12px' }}>
-                                    Query Results {message.queryResultCount && message.queryResultCount !== message.queryResult.length 
-                                      ? `(${message.queryResultCount} total, showing ${message.queryResult.length})` 
-                                      : `(${message.queryResult.length} ${message.queryResult.length === 1 ? 'row' : 'rows'})`}:
-                                  </Text>
-                                  <div style={{ marginTop: 8, maxHeight: '500px', overflow: 'auto', border: '1px solid #d9d9d9', borderRadius: 4, background: '#fff' }}>
-                                    <table style={{ width: '100%', fontSize: '12px', borderCollapse: 'collapse' }}>
-                                      <thead>
-                                        <tr style={{ background: '#f0f0f0', position: 'sticky', top: 0, zIndex: 1 }}>
-                                          {(message.queryResultColumns && message.queryResultColumns.length > 0
-                                            ? message.queryResultColumns
-                                            : Object.keys(message.queryResult[0])
-                                          ).map((key) => (
-                                            <th key={key} style={{ padding: '8px', textAlign: 'left', border: '1px solid #ddd', fontWeight: 'bold' }}>
-                                              {key}
-                                            </th>
-                                          ))}
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {message.queryResult.map((row, idx) => (
-                                          <tr key={idx} style={{ background: idx % 2 === 0 ? '#fff' : '#fafafa' }}>
-                                            {(message.queryResultColumns && message.queryResultColumns.length > 0
-                                              ? message.queryResultColumns
-                                              : Object.keys(message.queryResult[0])
-                                            ).map((col, colIdx) => (
-                                              <td key={colIdx} style={{ padding: '6px 8px', border: '1px solid #ddd', wordBreak: 'break-word' }}>
-                                                {String(row[col] !== null && row[col] !== undefined ? row[col] : '')}
-                                              </td>
-                                            ))}
-                                          </tr>
-                                        ))}
-                                      </tbody>
-                                    </table>
-                                    {message.queryResultCount && message.queryResultCount > message.queryResult.length && (
-                                      <div style={{ padding: '8px', background: '#f9f9f9', borderTop: '1px solid #ddd', textAlign: 'center' }}>
-                                        <Text type="secondary" style={{ fontSize: '11px' }}>
-                                          Showing {message.queryResult.length} of {message.queryResultCount} rows
-                                        </Text>
-                                      </div>
-                                    )}
-                                  </div>
-                                </div>
-                              ) : message.sqlExecuted && message.sql ? (
-                                // Show message if SQL executed but no results
-                                <div style={{ marginTop: 12, padding: 8, background: '#fff3cd', borderRadius: 4 }}>
-                                  <Text type="warning" style={{ fontSize: '12px' }}>
-                                    Query executed successfully but returned no results. 
-                                    {process.env.NODE_ENV === 'development' && (
-                                      <span> (Debug: queryResult={String(!!message.queryResult)}, length={message.queryResult?.length || 0})</span>
-                                    )}
-                                  </Text>
-                                </div>
-                              ) : null}
-                            </div>
-                            {message.sources && message.sources.length > 0 && (
-                              <div className="message-sources">
-                                <Text type="secondary" style={{ fontSize: '12px' }}>
-                                  Sources: {message.sources.join(', ')}
-                                </Text>
-                              </div>
-                            )}
-                            <div className="message-timestamp">
-                              {message.timestamp.toLocaleTimeString()}
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                      <div ref={messagesEndRef} />
-                    </div>
-                  )}
+          <div className="pdf-chat-main" style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+            <Tabs
+              className="database-chat-tabs"
+              activeKey={activeTab}
+              onChange={setActiveTab}
+              type="card"
+              tabBarGutter={16}
+              style={{ flex: 1, minHeight: 0 }}
+            >
+              <Tabs.TabPane tab="Chat" key="chat" forceRender>
+                <div style={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+                  {renderChatTab()}
                 </div>
-
-                <Footer className="chat-input-footer">
-                  <div className="input-container">
-                    <Input.TextArea
-                      ref={inputRef}
-                      value={inputValue}
-                      onChange={(e) => setInputValue(e.target.value)}
-                      onKeyPress={(e) => {
-                        if (e.key === 'Enter' && !e.shiftKey) {
-                          e.preventDefault();
-                          handleSendMessage();
-                        }
-                      }}
-                      placeholder="Ask questions about your database schema..."
-                      autoSize={{ minRows: 1, maxRows: 4 }}
-                      className="chat-input"
-                    />
-                    <Button
-                      type="primary"
-                      icon={<SendOutlined />}
-                      onClick={handleSendMessage}
-                      disabled={!inputValue.trim() || !sessionReady}
-                      className="send-btn"
-                    >
-                      Send
-                    </Button>
-                  </div>
-                </Footer>
-              </>
-            )}
+              </Tabs.TabPane>
+              <Tabs.TabPane tab="Chat Settings" key="settings" disabled={!currentConnection} forceRender>
+                <div style={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
+                  {renderKnowledgeTab()}
+                </div>
+              </Tabs.TabPane>
+            </Tabs>
           </div>
         </div>
       </Content>

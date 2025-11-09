@@ -257,6 +257,51 @@ export const databaseChatAPI = {
     const response = await api.get(url);
     return response.data;
   },
+
+  uploadKnowledge: async ({ connectionId, sessionId, title, description, file }) => {
+    const formData = new FormData();
+    if (connectionId !== undefined && connectionId !== null) {
+      formData.append('connection_id', String(connectionId));
+    }
+    if (sessionId !== undefined && sessionId !== null) {
+      formData.append('session_id', String(sessionId));
+    }
+    if (title) {
+      formData.append('title', title);
+    }
+    if (description) {
+      formData.append('description', description);
+    }
+    formData.append('file', file);
+    const response = await api.post('/api/database/knowledge', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+    return response.data;
+  },
+
+  getKnowledge: async (connectionId, sessionId = null) => {
+    let url = '/api/database/knowledge';
+    const params = [];
+    if (connectionId !== undefined && connectionId !== null) {
+      params.push(`connection_id=${connectionId}`);
+    }
+    if (sessionId !== undefined && sessionId !== null) {
+      params.push(`session_id=${sessionId}`);
+    }
+    if (params.length) {
+      url += `?${params.join('&')}`;
+    }
+    const response = await api.get(url);
+    return response.data;
+  },
+
+  deleteKnowledge: async (knowledgeId) => {
+    const response = await api.delete(`/api/database/knowledge/${knowledgeId}`);
+    return response.data;
+  },
+
+  getKnowledgeDownloadUrl: (knowledgeId) =>
+    `${API_BASE_URL}/api/database/knowledge/${knowledgeId}/download`,
 };
 
 export default api;

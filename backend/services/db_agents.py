@@ -160,7 +160,9 @@ class NLToSQLAgent:
         schema_details: Dict[str, Any],
         database_type: str,
         collection_name: Optional[str] = None,
-        embedding_model_name: Optional[str] = None
+        embedding_model_name: Optional[str] = None,
+        conversation_summary: Optional[str] = None,
+        additional_guidance: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Generate SQL query from natural language using semantic search
@@ -244,6 +246,13 @@ class NLToSQLAgent:
         # Build enhanced schema context with structured metadata
         structured_schema_info = self._build_structured_schema_context(schema_details)
         
+        # Condensed conversation context summary
+        conversation_context_text = None
+        if conversation_summary:
+            conversation_context_text = conversation_summary.strip()
+            if len(conversation_context_text) > 1200:
+                conversation_context_text = conversation_context_text[-1200:]
+        
         prompt = f"""You are an expert SQL query generator specializing in {database_type.upper()} databases. 
 Convert the following natural language query into a valid {database_type.upper()} SQL query.
 
@@ -255,6 +264,20 @@ Database Type: {database_type.upper()}
 === SEMANTICALLY RELEVANT SCHEMA CHUNKS (from vectorized search) ===
 {relevant_schema_text}
 
+"""
+        if conversation_context_text:
+            prompt += f"""
+=== CONVERSATION CONTEXT (recent messages) ===
+{conversation_context_text}
+"""
+
+        if additional_guidance:
+            prompt += f"""
+=== VALIDATION / ADDITIONAL GUIDANCE ===
+{additional_guidance}
+"""
+
+        prompt += f"""
 === USER QUERY ===
 "{user_query}"
 
@@ -492,9 +515,10 @@ Respond in JSON format:
                     result = json.loads(json_match.group())
                     
                     # Sanitize errors - make them user-friendly
-                    errors = result.get('errors', [])
+                    raw_errors = result.get('errors', [])
+                    raw_warnings = result.get('warnings', [])
                     user_friendly_errors = []
-                    for error in errors:
+                    for error in raw_errors:
                         error_lower = str(error).lower()
                         if 'table' in error_lower or 'does not exist' in error_lower:
                             user_friendly_errors.append("Table or column mismatch")
@@ -514,7 +538,9 @@ Respond in JSON format:
                         'valid': result.get('valid', False),
                         'corrected_sql': corrected_sql,
                         'errors': user_friendly_errors if not result.get('valid', False) else [],
-                        'warnings': result.get('warnings', []),
+                        'warnings': raw_warnings or [],
+                        'raw_errors': raw_errors or [],
+                        'raw_warnings': raw_warnings or [],
                         'validated_tables': result.get('validated_tables', []),
                         'validated_columns': result.get('validated_columns', [])
                     }
@@ -533,6 +559,8 @@ Respond in JSON format:
                     'corrected_sql': sql,
                     'errors': [],
                     'warnings': ['Validation could not be performed - using basic syntax check'],
+                    'raw_errors': [],
+                    'raw_warnings': ['Validation could not be performed - using basic syntax check'],
                     'validated_tables': [],
                     'validated_columns': []
                 }
@@ -542,6 +570,8 @@ Respond in JSON format:
                     'corrected_sql': None,
                     'errors': ['Invalid SQL statement type'],
                     'warnings': [],
+                    'raw_errors': ['Invalid SQL statement type'],
+                    'raw_warnings': [],
                     'validated_tables': [],
                     'validated_columns': []
                 }
@@ -552,6 +582,8 @@ Respond in JSON format:
                 'corrected_sql': None,
                 'errors': ['Unable to validate query'],
                 'warnings': [],
+                'raw_errors': ['Unable to validate query'],
+                'raw_warnings': [],
                 'validated_tables': [],
                 'validated_columns': []
             }
@@ -662,6 +694,7 @@ class DatabaseAgentSystem:
         collection_name: Optional[str] = None,
         embedding_model_name: Optional[str] = None,
         connection_string: Optional[str] = None,
+        conversation_summary: Optional[str] = None,
         **connection_params
     ) -> Dict[str, Any]:
         """
@@ -713,10 +746,10 @@ class DatabaseAgentSystem:
             
             # Step 2b: General chat response (no SQL needed)
             chat_response = self._generate_chat_response(
-                user_query, 
-                schema_details, 
+                user_query,
+                schema_details,
                 schema_text,
-                previous_context=None
+                conversation_summary=conversation_summary
             )
             result['chat_response'] = chat_response
             return result
@@ -728,7 +761,8 @@ class DatabaseAgentSystem:
             schema_details,
             database_type,
             collection_name=collection_name,
-            embedding_model_name=embedding_model_name
+            embedding_model_name=embedding_model_name,
+            conversation_summary=conversation_summary
         )
         result['sql'] = sql_result.get('sql')
         result['relevant_schema_parts'] = sql_result.get('relevant_schema_parts', [])
@@ -753,6 +787,50 @@ class DatabaseAgentSystem:
             result['sql'] = validation_result.get('corrected_sql')
             result['should_execute'] = True
         else:
+            # Attempt a single refinement using validation feedback and conversation context
+            guidance_text = self._build_validation_guidance(
+                user_query=user_query,
+                sql=result['sql'],
+                validation_result=validation_result,
+                schema_details=schema_details
+            )
+            
+            if guidance_text:
+                refined_summary = self._combine_summary_with_guidance(
+                    conversation_summary,
+                    guidance_text
+                )
+                summary_for_refinement = refined_summary or conversation_summary
+
+                refined_sql_result = self.nl_to_sql_agent.generate_sql(
+                    user_query,
+                    schema_details,
+                    database_type,
+                    collection_name=collection_name,
+                    embedding_model_name=embedding_model_name,
+                    conversation_summary=summary_for_refinement,
+                    additional_guidance=guidance_text
+                )
+                
+                if refined_sql_result.get('sql') and refined_sql_result.get('sql') != result['sql']:
+                    result['sql'] = refined_sql_result.get('sql')
+                    if refined_sql_result.get('relevant_schema_parts'):
+                        result['relevant_schema_parts'] = refined_sql_result.get('relevant_schema_parts')
+                    
+                    validation_result = self.sql_validation_agent.validate_and_correct_sql(
+                        result['sql'],
+                        schema_details,
+                        database_type,
+                        relevant_schema_parts=result.get('relevant_schema_parts', []),
+                        connection_string=connection_string,
+                        **connection_params
+                    )
+                    result['sql_validation'] = validation_result
+                    
+                    if validation_result.get('valid'):
+                        result['sql'] = validation_result.get('corrected_sql')
+                        result['should_execute'] = True
+            
             # SQL has errors, generate chat response explaining without exposing technical details
             errors = validation_result.get('errors', [])
             warnings = validation_result.get('warnings', [])
@@ -771,11 +849,179 @@ class DatabaseAgentSystem:
                         user_friendly_errors.append("The query has validation issues.")
                 
                 error_message = user_friendly_errors[0] if user_friendly_errors else "The generated SQL query has some issues."
-                result['chat_response'] = f"I tried to generate a SQL query, but {error_message.lower()} Could you rephrase your question or provide more specific details?"
+                if result.get('should_execute'):
+                    # Query successfully refined; no need to send error response
+                    pass
+                else:
+                    result['chat_response'] = f"I tried to generate a SQL query, but {error_message.lower()} Could you rephrase your question or provide more specific details?"
+                    table_hint = self._build_table_column_summary(
+                        self._extract_tables_from_sql(result['sql']),
+                        schema_details
+                    )
+                    if table_hint:
+                        result['chat_response'] += f"\n\nHere's what the schema shows for the tables involved:\n{table_hint}"
             else:
-                result['chat_response'] = "I generated a SQL query, but it needs verification. Could you provide more details about what you're looking for?"
+                if not result.get('should_execute'):
+                    result['chat_response'] = "I generated a SQL query, but it needs verification. Could you provide more details about what you're looking for?"
         
         return result
+    
+    def _combine_summary_with_guidance(
+        self,
+        base_summary: Optional[str],
+        guidance: Optional[str]
+    ) -> Optional[str]:
+        parts: List[str] = []
+        if base_summary:
+            cleaned = base_summary.strip()
+            if cleaned:
+                parts.append(cleaned)
+        if guidance:
+            cleaned_guidance = guidance.strip()
+            if cleaned_guidance:
+                parts.append(f"Validation feedback to incorporate:\n{cleaned_guidance}")
+        if not parts:
+            return None
+        combined = "\n\n".join(parts)
+        if len(combined) > 1500:
+            combined = combined[-1500:]
+        return combined
+
+    def _build_validation_guidance(
+        self,
+        user_query: str,
+        sql: Optional[str],
+        validation_result: Dict[str, Any],
+        schema_details: Dict[str, Any]
+    ) -> Optional[str]:
+        if not sql:
+            return None
+        
+        raw_errors = validation_result.get('raw_errors') or validation_result.get('errors') or []
+        raw_warnings = validation_result.get('raw_warnings') or validation_result.get('warnings') or []
+        
+        table_names = self._extract_tables_from_sql(sql)
+        table_summary = self._build_table_column_summary(table_names, schema_details)
+        relationship_summary = self._build_relationship_summary(table_names, schema_details)
+        
+        sections = []
+        sections.append(f"User query: {user_query}")
+        sections.append(f"Previous SQL attempt:\n{sql}")
+        
+        if raw_errors:
+            sections.append("Validation feedback:")
+            for err in raw_errors:
+                sections.append(f"- {err}")
+        if raw_warnings:
+            sections.append("Warnings:")
+            for warn in raw_warnings:
+                sections.append(f"- {warn}")
+        if table_summary:
+            sections.append("Relevant table column details:")
+            sections.append(table_summary)
+        if relationship_summary:
+            sections.append("Relevant relationships:")
+            sections.append(relationship_summary)
+        
+        guidance = "\n".join(sections).strip()
+        return guidance if guidance else None
+    
+    def _extract_tables_from_sql(self, sql: str) -> List[str]:
+        if not sql:
+            return []
+        
+        pattern = re.compile(r'\bFROM\s+([a-zA-Z0-9_."`]+)(?:\s+AS)?\s*(\w+)?|\bJOIN\s+([a-zA-Z0-9_."`]+)', re.IGNORECASE)
+        matches = pattern.findall(sql)
+        order_preserved = []
+        seen = set()
+        for match in matches:
+            table_candidate = match[0] or match[2]
+            if not table_candidate:
+                continue
+            cleaned = table_candidate.strip().strip('"`')
+            # Remove schema prefix if present (e.g., public.table)
+            if '.' in cleaned:
+                cleaned = cleaned.split('.')[-1]
+            if cleaned and cleaned.lower() not in seen:
+                order_preserved.append(cleaned)
+                seen.add(cleaned.lower())
+        return order_preserved
+    
+    def _build_table_column_summary(self, table_names: List[str], schema_details: Dict[str, Any]) -> str:
+        if not table_names or not schema_details:
+            return ""
+        
+        tables = schema_details.get('tables', [])
+        lines = []
+        max_tables = 6
+        max_columns = 15
+        
+        for table_name in table_names[:max_tables]:
+            table_info = next(
+                (t for t in tables if t.get('name', '').lower() == table_name.lower()),
+                None
+            )
+            if not table_info:
+                continue
+            columns = table_info.get('columns', [])
+            column_names = [col.get('name', '') for col in columns]
+            if column_names:
+                display_cols = column_names[:max_columns]
+                col_text = ", ".join(display_cols)
+                if len(column_names) > max_columns:
+                    col_text += ", ..."
+                lines.append(f"- {table_info.get('name')}: {col_text}")
+            else:
+                lines.append(f"- {table_info.get('name')}: (no column information available)")
+        return "\n".join(lines)
+    
+    def _build_relationship_summary(self, table_names: List[str], schema_details: Dict[str, Any]) -> str:
+        if not table_names or not schema_details:
+            return ""
+        
+        tables = schema_details.get('tables', [])
+        relevant_relationships = []
+        
+        # Outbound foreign keys
+        for table in tables:
+            if table.get('name', '').lower() not in [name.lower() for name in table_names]:
+                continue
+            for fk in table.get('foreign_keys', []):
+                target_table = fk.get('referred_table')
+                constrained_cols = ", ".join(fk.get('constrained_columns', []))
+                referred_cols = ", ".join(fk.get('referred_columns', []))
+                relevant_relationships.append(
+                    f"{table.get('name')}({constrained_cols}) -> {target_table}({referred_cols})"
+                )
+        
+        # Inbound foreign keys (other tables pointing to these tables)
+        target_names = {name.lower() for name in table_names}
+        for table in tables:
+            for fk in table.get('foreign_keys', []):
+                target_table = fk.get('referred_table', '').lower()
+                if target_table in target_names:
+                    constrained_cols = ", ".join(fk.get('constrained_columns', []))
+                    referred_cols = ", ".join(fk.get('referred_columns', []))
+                    relevant_relationships.append(
+                        f"{table.get('name')}({constrained_cols}) -> {fk.get('referred_table')}({referred_cols})"
+                    )
+        
+        if relevant_relationships:
+            # Deduplicate while preserving order
+            seen = set()
+            unique_relationships = []
+            for rel in relevant_relationships:
+                if rel not in seen:
+                    unique_relationships.append(rel)
+                    seen.add(rel)
+            max_relationships = 12
+            trimmed = unique_relationships[:max_relationships]
+            lines = [f"- {rel}" for rel in trimmed]
+            if len(unique_relationships) > max_relationships:
+                lines.append("- ...")
+            return "\n".join(lines)
+        
+        return ""
     
     def _handle_schema_metadata_question(
         self,
@@ -842,7 +1088,7 @@ class DatabaseAgentSystem:
         user_query: str,
         schema_details: Dict[str, Any],
         schema_text: str,
-        previous_context: Optional[List[Dict]] = None
+        conversation_summary: Optional[str] = None
     ) -> str:
         """Generate chat response for non-SQL queries"""
         # Build context with full schema metadata for accuracy
@@ -864,13 +1110,13 @@ class DatabaseAgentSystem:
         
         context = "\n\n".join(context_parts) if context_parts else "Database Schema Context: Not available"
         
-        if previous_context:
-            messages = previous_context + [{"role": "user", "content": user_query}]
-        else:
-            messages = [
-                {"role": "system", "content": f"You are a helpful database assistant. {context}"},
-                {"role": "user", "content": user_query}
-            ]
+        if conversation_summary:
+            context = f"{context}\n\nConversation Summary:\n{conversation_summary}\n\nUse this summary instead of the full chat history."
+
+        messages = [
+            {"role": "system", "content": f"You are a helpful database assistant. {context}"},
+            {"role": "user", "content": user_query}
+        ]
         
         try:
             response = self.llm_service.generate_response(

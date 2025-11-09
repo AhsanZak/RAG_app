@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import uvicorn
@@ -7,11 +8,33 @@ import requests
 import json
 import aiofiles
 import os
+import uuid
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider, EmbeddingModel, DatabaseConnection, DatabaseSchema
+from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider, EmbeddingModel, DatabaseConnection, DatabaseSchema, DatabaseKnowledge
 from config.embedding_models import AVAILABLE_EMBEDDINGS, get_default_embedding_model, get_embedding_model_info, list_embedding_models
+
+KNOWLEDGE_UPLOAD_DIR = os.path.join(os.getcwd(), "uploads", "database_knowledge")
+os.makedirs(KNOWLEDGE_UPLOAD_DIR, exist_ok=True)
+
+
+def _serialize_knowledge_item(item: DatabaseKnowledge) -> Dict[str, Any]:
+    return {
+        "id": item.id,
+        "connection_id": item.connection_id,
+        "session_id": item.session_id,
+        "user_id": item.user_id,
+        "title": item.title,
+        "description": item.description,
+        "original_filename": item.original_filename,
+        "file_type": item.file_type,
+        "content_type": item.content_type,
+        "file_url": f"/api/database/knowledge/{item.id}/download",
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+        "created_at_human": item.created_at.strftime("%Y-%m-%d %H:%M:%S") if item.created_at else None,
+        "tags": item.tags or [],
+    }
 
 def _create_enriched_schema_chunks(schema_data: dict, schema_text: str) -> List[dict]:
     """
@@ -196,6 +219,87 @@ Relationship Type: Foreign Key Constraint
             })
     
     return chunks
+
+
+def _build_condensed_chat_summary(
+    chroma_service: "ChromaDBService",
+    embed_service: "EmbeddingService",
+    collection_name: str,
+    user_query: str,
+    embedding_model_name: str,
+    fallback_messages: Optional[List["ChatMessageModel"]] = None,
+    max_items: int = 5,
+    max_chars: int = 1200
+) -> Optional[str]:
+    """
+    Build a condensed conversational summary using vectorized chat history.
+    Falls back to latest raw messages if vector retrieval fails.
+    """
+    summary_lines: List[str] = []
+
+    try:
+        query_embedding = embed_service.generate_embeddings(
+            [user_query],
+            model_name=embedding_model_name
+        )
+        if query_embedding.ndim == 1:
+            query_embedding = query_embedding.reshape(1, -1)
+
+        results = chroma_service.query_collection(
+            collection_name=collection_name,
+            query_embeddings=query_embedding,
+            n_results=max_items,
+            include=["documents", "metadatas", "distances"]
+        )
+
+        documents = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
+        if documents and len(documents) > 0:
+            doc_list = documents[0]
+            meta_list = metadatas[0] if metadatas else [{}] * len(doc_list)
+
+            for doc, meta in zip(doc_list[:max_items], meta_list[:max_items]):
+                if not isinstance(doc, str):
+                    continue
+
+                role = "Message"
+                if isinstance(meta, dict):
+                    role = meta.get("role", role)
+
+                text = doc.strip()
+                if ":" in text:
+                    prefix, remainder = text.split(":", 1)
+                    if not isinstance(meta, dict) or not meta.get("role"):
+                        role = prefix.strip()
+                    text = remainder.strip()
+
+                text = " ".join(text.split())
+                if len(text) > 200:
+                    text = text[:197] + "..."
+
+                summary_lines.append(f"{role.title()}: {text}")
+
+    except Exception as e:
+        print(f"[Chat] Unable to build vectorized conversation summary: {str(e)}")
+
+    if not summary_lines and fallback_messages:
+        recent = fallback_messages[-max_items:]
+        for msg in recent:
+            role = getattr(msg, "role", "message").title()
+            text = getattr(msg, "message", "")
+            text = " ".join((text or "").split())
+            if len(text) > 200:
+                text = text[:197] + "..."
+            summary_lines.append(f"{role}: {text}")
+
+    if not summary_lines:
+        return None
+
+    summary_text = "Relevant conversation context:\n" + "\n".join(f"- {line}" for line in summary_lines)
+    if len(summary_text) > max_chars:
+        summary_text = summary_text[: max_chars - 3] + "..."
+    return summary_text
+
 from services.pdf_processor import PDFProcessor
 from services.embedding_service import EmbeddingService
 from services.chromadb_service import ChromaDBService
@@ -1601,16 +1705,38 @@ async def database_chat(
             ChatMessageModel.session_id == session_id
         ).order_by(ChatMessageModel.created_at).limit(10).all()
         
-        previous_context = [
-            {"role": msg.role, "content": msg.message} 
-            for msg in previous_messages
-        ] if previous_messages else None
-        
         # Collection name for semantic search
         collection_name = f"db_session_{session_id}"
         
         # Get embedding model name (use default if not specified)
         embedding_model_name = get_default_embedding_model()
+        
+        # Build condensed conversation summary (prefer vectorized history)
+        conversation_summary = None
+        try:
+            collections = chromadb_service.list_collections()
+            if collection_name in collections:
+                conversation_summary = _build_condensed_chat_summary(
+                    chromadb_service,
+                    embedding_service,
+                    collection_name,
+                    message,
+                    embedding_model_name,
+                    fallback_messages=previous_messages
+                )
+        except Exception as e:
+            print(f"[Chat] Unable to build conversation summary from vectors: {str(e)}")
+        
+        if not conversation_summary and previous_messages:
+            fallback_lines = []
+            for msg in previous_messages[-5:]:
+                role = msg.role.title()
+                text = (msg.message or "").strip().replace("\n", " ")
+                if len(text) > 200:
+                    text = text[:197] + "..."
+                fallback_lines.append(f"{role}: {text}")
+            if fallback_lines:
+                conversation_summary = "Recent conversation highlights:\n" + "\n".join(f"- {line}" for line in fallback_lines)
         
         # Process query through agent system with semantic search
         agent_result = db_agent_system.process_query(
@@ -1625,7 +1751,8 @@ async def database_chat(
             port=connection.port,
             database_name=connection.database_name,
             username=connection.username,
-            password=connection.password
+            password=connection.password,
+            conversation_summary=conversation_summary
         )
         
         # Prepare response
@@ -1928,10 +2055,117 @@ async def get_database_schema(
         "session_id": schema.session_id,
         "schema_data": schema.schema_data,
         "schema_text": schema.schema_text,
-        "is_processed": schema.is_processed,
-        "created_at": schema.created_at.isoformat(),
+        "is_processed": bool(schema.is_processed),
+        "created_at": schema.created_at.isoformat() if schema.created_at else None,
         "updated_at": schema.updated_at.isoformat() if schema.updated_at else None
     }
+
+
+@app.post("/api/database/knowledge")
+async def upload_database_knowledge(
+    connection_id: Optional[int] = Form(None),
+    session_id: Optional[int] = Form(None),
+    user_id: int = Form(1),
+    title: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """Upload knowledge document for database chat"""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="File must have a filename")
+    
+    filename = file.filename
+    ext = os.path.splitext(filename)[1] or ""
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    save_path = os.path.join(KNOWLEDGE_UPLOAD_DIR, unique_name)
+    
+    try:
+        async with aiofiles.open(save_path, "wb") as out_file:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                await out_file.write(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to store file: {str(e)}")
+    
+    knowledge = DatabaseKnowledge(
+        connection_id=connection_id,
+        session_id=session_id,
+        user_id=user_id,
+        title=title or os.path.splitext(filename)[0],
+        description=description,
+        original_filename=filename,
+        file_path=save_path,
+        file_type=ext.lstrip(".").lower(),
+        content_type=file.content_type,
+        tags=None,
+    )
+    
+    db.add(knowledge)
+    db.commit()
+    db.refresh(knowledge)
+    
+    return _serialize_knowledge_item(knowledge)
+
+
+@app.get("/api/database/knowledge")
+async def list_database_knowledge(
+    connection_id: Optional[int] = None,
+    session_id: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
+    """List uploaded knowledge documents"""
+    query = db.query(DatabaseKnowledge)
+    if connection_id is not None:
+        query = query.filter(DatabaseKnowledge.connection_id == connection_id)
+    if session_id is not None:
+        query = query.filter(DatabaseKnowledge.session_id == session_id)
+    items = query.order_by(DatabaseKnowledge.created_at.desc()).all()
+    return [_serialize_knowledge_item(item) for item in items]
+
+
+@app.get("/api/database/knowledge/{knowledge_id}/download")
+async def download_database_knowledge(
+    knowledge_id: int,
+    db: Session = Depends(get_db)
+):
+    """Download a knowledge document"""
+    knowledge = db.query(DatabaseKnowledge).filter(DatabaseKnowledge.id == knowledge_id).first()
+    if not knowledge:
+        raise HTTPException(status_code=404, detail="Knowledge document not found")
+    
+    if not os.path.exists(knowledge.file_path):
+        raise HTTPException(status_code=404, detail="File not found on server")
+    
+    filename = knowledge.original_filename or os.path.basename(knowledge.file_path)
+    media_type = knowledge.content_type or "application/octet-stream"
+    return FileResponse(knowledge.file_path, media_type=media_type, filename=filename)
+
+
+@app.delete("/api/database/knowledge/{knowledge_id}")
+async def delete_database_knowledge(
+    knowledge_id: int,
+    db: Session = Depends(get_db)
+):
+    """Delete knowledge document"""
+    knowledge = db.query(DatabaseKnowledge).filter(DatabaseKnowledge.id == knowledge_id).first()
+    if not knowledge:
+        raise HTTPException(status_code=404, detail="Knowledge document not found")
+    
+    file_path = knowledge.file_path
+    
+    db.delete(knowledge)
+    db.commit()
+    
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+    
+    return {"success": True}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
