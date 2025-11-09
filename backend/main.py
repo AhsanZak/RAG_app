@@ -1082,9 +1082,38 @@ async def get_sessions(
             collection_name = f"db_session_{s.id}"
             session_type = "database"
         else:
-            # PDF session - use session_ prefix
+            # PDF/Excel sessions use session_ prefix
             collection_name = f"session_{s.id}"
             session_type = "pdf"
+            
+            # Try to determine if this session belongs to Excel chat based on metadata
+            if collection_name in existing_collections:
+                try:
+                    sample = chromadb_service.peek_collection(collection_name, n_results=3)
+                    metadata_entries = sample.get("metadatas") or []
+                    
+                    # Flatten metadata lists and keep dicts only
+                    flattened_metadata = []
+                    for item in metadata_entries:
+                        if isinstance(item, dict):
+                            flattened_metadata.append(item)
+                        elif isinstance(item, list):
+                            flattened_metadata.extend([meta for meta in item if isinstance(meta, dict)])
+                    
+                    def is_excel_metadata(meta: Dict) -> bool:
+                        filename = meta.get("filename", "")
+                        sheet_name = meta.get("sheet_name")
+                        file_type = meta.get("file_type")
+                        return (
+                            file_type == "excel"
+                            or bool(sheet_name)
+                            or (isinstance(filename, str) and filename.lower().endswith((".xlsx", ".xls", ".xlsm")))
+                        )
+                    
+                    if any(is_excel_metadata(meta) for meta in flattened_metadata):
+                        session_type = "excel"
+                except Exception as e:
+                    print(f"[SESSIONS] Could not inspect collection '{collection_name}' metadata: {e}")
         
         has_vectorized_data = collection_name in existing_collections
         

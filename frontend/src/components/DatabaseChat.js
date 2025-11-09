@@ -27,7 +27,10 @@ import {
   LoadingOutlined,
   PlusOutlined,
   ReloadOutlined,
-  SyncOutlined
+  SyncOutlined,
+  FileTextOutlined,
+  DownloadOutlined,
+  EditOutlined
 } from '@ant-design/icons';
 import Markdown from 'react-markdown';
 import { llmModelsAPI, databaseChatAPI, embeddingModelsAPI } from '../services/api';
@@ -60,6 +63,12 @@ const DatabaseChat = ({ onBack }) => {
   const [connectionForm] = Form.useForm();
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
+  const [schemaModalVisible, setSchemaModalVisible] = useState(false);
+  const [schemaJsonContent, setSchemaJsonContent] = useState('');
+  const [schemaTextContent, setSchemaTextContent] = useState('');
+  const [schemaModalSaving, setSchemaModalSaving] = useState(false);
+  const [schemaModalError, setSchemaModalError] = useState(null);
+  const [schemaModalTab, setSchemaModalTab] = useState('structured');
 
   // Default ports for different database types
   const defaultPorts = {
@@ -128,6 +137,73 @@ const DatabaseChat = ({ onBack }) => {
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  const handleOpenSchemaModal = () => {
+    if (!schemaData) {
+      message.warning('Schema not available yet. Please extract schema first.');
+      return;
+    }
+
+    try {
+      const formattedJson = JSON.stringify(schemaData.schema_data || {}, null, 2);
+      setSchemaJsonContent(formattedJson);
+      setSchemaTextContent(schemaData.schema_text || '');
+      setSchemaModalError(null);
+      setSchemaModalTab('structured');
+      setSchemaModalVisible(true);
+    } catch (error) {
+      console.error('Failed to prepare schema JSON for editing:', error);
+      message.error('Failed to prepare schema for editing');
+    }
+  };
+
+  const handleCloseSchemaModal = () => {
+    if (schemaModalSaving) {
+      return;
+    }
+    setSchemaModalVisible(false);
+    setSchemaModalError(null);
+  };
+
+  const handleDownloadSchema = (format = 'json') => {
+    if (!schemaData) {
+      message.warning('Schema not available to download yet.');
+      return;
+    }
+
+    try {
+      let content = '';
+      let mimeType = 'application/json';
+      let extension = 'json';
+
+      if (format === 'json') {
+        content = JSON.stringify(schemaData.schema_data || {}, null, 2);
+      } else if (format === 'text') {
+        content = schemaData.schema_text || 'No schema summary available.';
+        mimeType = 'text/plain';
+        extension = 'txt';
+      } else {
+        throw new Error('Unsupported download format');
+      }
+
+      const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const safeConnectionName = currentConnection?.name
+        ? currentConnection.name.replace(/\s+/g, '_').toLowerCase()
+        : 'database';
+      link.download = `${safeConnectionName}_schema.${extension}`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+      message.success(`Schema ${format === 'json' ? 'JSON' : 'summary'} downloaded`);
+    } catch (error) {
+      console.error('Failed to download schema:', error);
+      message.error('Failed to download schema');
+    }
   };
 
   const handleTestConnection = async () => {
@@ -325,8 +401,10 @@ const DatabaseChat = ({ onBack }) => {
     }
   };
 
-  const handleProcessSchema = async () => {
-    if (!schemaData || !currentConnection) {
+  const handleProcessSchema = async (schemaOverride = null) => {
+    const activeSchema = schemaOverride || schemaData;
+
+    if (!activeSchema || !currentConnection) {
       message.warning('Please extract schema first');
       return;
     }
@@ -391,6 +469,58 @@ const DatabaseChat = ({ onBack }) => {
       message.error(error.response?.data?.detail || 'Failed to process schema');
     } finally {
       setProcessingSchema(false);
+    }
+  };
+
+  const handleSaveSchemaEdits = async ({ vectorizeAfterSave = false } = {}) => {
+    if (!currentConnection) {
+      message.warning('Select a connection before editing schema.');
+      return;
+    }
+
+    try {
+      setSchemaModalError(null);
+      let parsedSchema = null;
+
+      try {
+        parsedSchema = JSON.parse(schemaJsonContent || '{}');
+      } catch (parseError) {
+        setSchemaModalError('Schema JSON is invalid. Please fix the JSON before saving.');
+        return;
+      }
+
+      setSchemaModalSaving(true);
+      const payload = {
+        connection_id: currentConnection.id,
+        schema_data: parsedSchema,
+        schema_text: schemaTextContent
+      };
+
+      const saveResult = await databaseChatAPI.saveSchema(payload);
+      if (saveResult.success) {
+        const updatedSchema = {
+          ...(schemaData || {}),
+          schema_data: parsedSchema,
+          schema_text: schemaTextContent
+        };
+        setSchemaData(updatedSchema);
+        setSessionReady(false);
+        setCurrentSession(null);
+        setChatMessages([]);
+
+        message.success('Schema updated. Please vectorize to refresh the chat context.');
+
+        if (vectorizeAfterSave) {
+          setSchemaModalVisible(false);
+          await handleProcessSchema(updatedSchema);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to save schema edits:', error);
+      const detail = error.response?.data?.detail;
+      setSchemaModalError(detail || 'Failed to save schema changes. Please try again.');
+    } finally {
+      setSchemaModalSaving(false);
     }
   };
 
@@ -675,6 +805,22 @@ const DatabaseChat = ({ onBack }) => {
                       >
                         Re-extract Schema
                       </Button>
+                      <Button
+                        block
+                        icon={<FileTextOutlined />}
+                        style={{ marginTop: 8 }}
+                        onClick={handleOpenSchemaModal}
+                      >
+                        View / Edit Schema
+                      </Button>
+                      <Button
+                        block
+                        icon={<DownloadOutlined />}
+                        style={{ marginTop: 8 }}
+                        onClick={() => handleDownloadSchema('json')}
+                      >
+                        Download Schema JSON
+                      </Button>
                       {!sessionReady && (
                         <Button
                           type="primary"
@@ -922,6 +1068,115 @@ const DatabaseChat = ({ onBack }) => {
           </div>
         </div>
       </Content>
+
+      {/* Schema View / Edit Modal */}
+      <Modal
+        title={
+          <Space>
+            <EditOutlined />
+            <span>View / Edit Extracted Schema</span>
+          </Space>
+        }
+        open={schemaModalVisible}
+        onCancel={handleCloseSchemaModal}
+        width={900}
+        footer={[
+          <Button
+            key="download-json"
+            icon={<DownloadOutlined />}
+            onClick={() => handleDownloadSchema('json')}
+            disabled={!schemaData}
+          >
+            Download JSON
+          </Button>,
+          <Button
+            key="download-text"
+            icon={<DownloadOutlined />}
+            onClick={() => handleDownloadSchema('text')}
+            disabled={!schemaData}
+          >
+            Download Summary
+          </Button>,
+          <Button key="cancel" onClick={handleCloseSchemaModal}>
+            Cancel
+          </Button>,
+          <Button
+            key="save"
+            type="primary"
+            loading={schemaModalSaving}
+            onClick={() => handleSaveSchemaEdits({ vectorizeAfterSave: false })}
+          >
+            Save Changes
+          </Button>,
+          <Button
+            key="save-vectorize"
+            type="primary"
+            loading={schemaModalSaving || processingSchema}
+            onClick={() => handleSaveSchemaEdits({ vectorizeAfterSave: true })}
+          >
+            Save & Vectorize
+          </Button>
+        ]}
+      >
+        {!schemaData ? (
+          <Alert
+            message="Schema not available"
+            description="Extract schema before attempting to view or edit it."
+            type="warning"
+            showIcon
+          />
+        ) : (
+          <>
+            <Alert
+              message={`Connection: ${currentConnection?.name || 'Unknown'}`}
+              description={
+                <div>
+                  <div>
+                    Tables: {schemaData.schema_data?.metadata?.total_tables ?? 0} — Columns:{' '}
+                    {schemaData.schema_data?.metadata?.total_columns ?? 0}
+                  </div>
+                  {!sessionReady && (
+                    <div style={{ marginTop: 4 }}>
+                      Schema changes require re-vectorization before chatting.
+                    </div>
+                  )}
+                </div>
+              }
+              type={sessionReady ? 'info' : 'warning'}
+              showIcon
+              style={{ marginBottom: 16 }}
+            />
+            {schemaModalError && (
+              <Alert
+                type="error"
+                message={schemaModalError}
+                showIcon
+                closable
+                onClose={() => setSchemaModalError(null)}
+                style={{ marginBottom: 16 }}
+              />
+            )}
+            <Tabs activeKey={schemaModalTab} onChange={setSchemaModalTab}>
+              <TabPane tab="Structured JSON" key="structured">
+                <Input.TextArea
+                  value={schemaJsonContent}
+                  onChange={(e) => setSchemaJsonContent(e.target.value)}
+                  autoSize={{ minRows: 18, maxRows: 32 }}
+                  spellCheck={false}
+                />
+              </TabPane>
+              <TabPane tab="Schema Summary" key="summary">
+                <Input.TextArea
+                  value={schemaTextContent}
+                  onChange={(e) => setSchemaTextContent(e.target.value)}
+                  autoSize={{ minRows: 18, maxRows: 32 }}
+                  placeholder="Human-readable schema summary"
+                />
+              </TabPane>
+            </Tabs>
+          </>
+        )}
+      </Modal>
 
       {/* Connection Modal */}
       <Modal
