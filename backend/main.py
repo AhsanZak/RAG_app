@@ -1147,8 +1147,8 @@ async def get_session_messages(
     messages = db.query(ChatMessageModel).filter(
         ChatMessageModel.session_id == session_id
     ).order_by(ChatMessageModel.created_at).all()
-    
-    return [
+
+    response_payload = [
         {
             "id": m.id,
             "role": m.role,
@@ -1158,6 +1158,16 @@ async def get_session_messages(
         }
         for m in messages
     ]
+
+    print(
+        "[SessionMessages]",
+        f"session_id={session_id}",
+        f"message_count={len(response_payload)}",
+        f"message_ids={[msg['id'] for msg in response_payload]}"
+    )
+    print("[SessionMessages] payload=", response_payload)
+
+    return response_payload
 
 # Database Schema Chat Endpoints
 @app.post("/api/database/connections")

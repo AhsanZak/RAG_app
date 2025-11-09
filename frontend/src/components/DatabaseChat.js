@@ -322,15 +322,51 @@ const DatabaseChat = ({ onBack }) => {
     setSessionReady(session.hasVectorizedData || false);
     
     try {
-      // Load messages for this session
       const messagesData = await databaseChatAPI.getSessionMessages(session.id);
-      const formattedMessages = messagesData.map(msg => ({
-        id: msg.id,
-        role: msg.role,
-        content: msg.message || msg.content,
-        timestamp: new Date(msg.created_at),
-        metadata: msg.metadata || {}
-      }));
+      const formattedMessages = messagesData.map((msg) => {
+        const metadata = msg.metadata || {};
+        const queryMeta = metadata.query_result || {};
+        const queryData = Array.isArray(queryMeta.data) ? queryMeta.data : [];
+        const queryColumns =
+          Array.isArray(queryMeta.columns) && queryMeta.columns.length > 0
+            ? queryMeta.columns
+            : (queryData.length > 0 && typeof queryData[0] === 'object'
+                ? Object.keys(queryData[0])
+                : []);
+        let baseText = msg.message || msg.content || '';
+        if (metadata.sql) {
+          baseText += `\n\n**Executed SQL:**\n\`\`\`sql\n${metadata.sql}\n\`\`\``;
+        }
+        let detailText = '';
+        if (Array.isArray(metadata.debug_messages) && metadata.debug_messages.length > 0) {
+          detailText += `\n\n**Debug Info:**\n${metadata.debug_messages.join('\n')}`;
+        }
+        if (Array.isArray(queryData) && queryData.length > 0) {
+          detailText += `\n\n**Rows Returned:** ${queryMeta.row_count ?? queryData.length}`;
+        } else if (metadata.query_error) {
+          detailText += `\n\n**Query Error:** ${metadata.query_error.message || metadata.query_error}`;
+        }
+        const combinedContent = [baseText, detailText].filter(Boolean).join('\n\n');
+        const rowCount = typeof queryMeta.row_count === 'number'
+          ? queryMeta.row_count
+          : queryData.length;
+
+        const sql = metadata.sql;
+        const sqlExecuted = Boolean(sql) && (queryData.length > 0 || rowCount > 0);
+
+        return {
+          id: msg.id,
+          role: msg.role,
+          content: combinedContent,
+          timestamp: new Date(msg.created_at),
+          metadata,
+          sql,
+          sqlExecuted,
+          queryResult: queryData,
+          queryResultCount: rowCount,
+          queryResultColumns: queryColumns,
+        };
+      });
       setChatMessages(formattedMessages);
     } catch (error) {
       console.error('Error loading session messages:', error);
@@ -592,10 +628,25 @@ const DatabaseChat = ({ onBack }) => {
         queryResultColumns = Object.keys(queryResultArray[0]);
       }
 
+      let baseText = response.response || '';
+      if (response.sql) {
+        baseText += `\n\n**Executed SQL:**\n\`\`\`sql\n${response.sql}\n\`\`\``;
+      }
+      let detailText = '';
+      if (Array.isArray(response.debug_messages) && response.debug_messages.length > 0) {
+        detailText += `\n\n**Debug Info:**\n${response.debug_messages.join('\n')}`;
+      }
+      if (Array.isArray(queryResultArray) && queryResultArray.length > 0) {
+        detailText += `\n\n**Rows Returned:** ${response.query_result_count ?? queryResultArray.length}`;
+      } else if (response.metadata?.query_error) {
+        detailText += `\n\n**Query Error:** ${response.metadata.query_error.message || response.metadata.query_error}`;
+      }
+      const combinedContent = [baseText, detailText].filter(Boolean).join('\n\n');
+
       const assistantResponse = {
         id: response.message_id || Date.now() + 1,
         role: 'assistant',
-        content: response.response,
+        content: combinedContent,
         timestamp: new Date(),
         sources: response.sources || [],
         sql: response.sql,
