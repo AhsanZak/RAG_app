@@ -1248,6 +1248,7 @@ class DatabaseAgentSystem:
             sections.append("Warnings:")
             for warn in raw_warnings:
                 sections.append(f"- {warn}")
+
         if table_summary:
             sections.append("Relevant table column details:")
             sections.append(table_summary)
