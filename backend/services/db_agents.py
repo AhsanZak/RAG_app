@@ -144,6 +144,274 @@ Respond in JSON format:
         return []
 
 
+class TableSelectionAgent:
+    """Agent to identify the most relevant tables for a user query"""
+    
+    def __init__(
+        self,
+        llm_service: LLMService,
+        embedding_service: Optional[EmbeddingService] = None,
+        model_config: Optional[Dict] = None
+    ):
+        self.llm_service = llm_service
+        self.embedding_service = embedding_service
+        self.model_config = model_config or {}
+    
+    def _build_table_descriptor(self, table: Dict[str, Any]) -> str:
+        name = table.get('name', 'unknown')
+        columns = [col.get('name', '') for col in table.get('columns', [])]
+        formatted_columns = ', '.join(columns[:15])
+        if len(columns) > 15:
+            formatted_columns += ', ...'
+        
+        descriptor_parts = [f"Table: {name}"]
+        if columns:
+            descriptor_parts.append(f"Columns: {formatted_columns}")
+        
+        pk = table.get('primary_keys', [])
+        if pk:
+            descriptor_parts.append(f"Primary Keys: {', '.join(pk)}")
+        
+        fks = table.get('foreign_keys', [])
+        if fks:
+            fk_desc = []
+            for fk in fks[:6]:
+                constrained = ', '.join(fk.get('constrained_columns', []))
+                referred = fk.get('referred_table', '')
+                referred_cols = ', '.join(fk.get('referred_columns', []))
+                fk_desc.append(f"{constrained} -> {referred}({referred_cols})")
+            if len(fks) > 6:
+                fk_desc.append("...")
+            descriptor_parts.append(f"Foreign Keys: {'; '.join(fk_desc)}")
+        
+        return '\n'.join(descriptor_parts)
+    
+    def select_tables(
+        self,
+        user_query: str,
+        schema_details: Dict[str, Any],
+        embedding_model_name: Optional[str] = None,
+        max_tables: int = 6
+    ) -> Dict[str, Any]:
+        result = {
+            "selected_tables": [],
+            "confidence": 0.0,
+            "reasoning": "",
+            "selection_method": "fallback_all",
+            "table_context_chunks": []
+        }
+        
+        if not schema_details or 'tables' not in schema_details:
+            return result
+        
+        tables = schema_details.get('tables', [])
+        table_names = [table.get('name') for table in tables if table.get('name')]
+        if not table_names:
+            return result
+        
+        # Build descriptors for similarity scoring
+        descriptors = []
+        for table in tables:
+            table_name = table.get('name')
+            if not table_name:
+                continue
+            descriptor_text = self._build_table_descriptor(table)
+            descriptors.append({
+                "name": table_name,
+                "text": descriptor_text,
+                "raw": table
+            })
+        
+        # If embedding service unavailable, return all tables (no restriction)
+        if not self.embedding_service or not embedding_model_name:
+            result.update({
+                "selected_tables": table_names[:max_tables],
+                "confidence": 0.0,
+                "reasoning": "Embedding service unavailable - using first tables as fallback",
+                "selection_method": "fallback_limited",
+                "table_context_chunks": [d["text"] for d in descriptors[:max_tables]]
+            })
+            return result
+        
+        try:
+            # Embed query and table descriptors
+            query_vec = self.embedding_service.generate_embeddings(
+                [user_query],
+                model_name=embedding_model_name
+            )
+            table_vecs = self.embedding_service.generate_embeddings(
+                [d["text"] for d in descriptors],
+                model_name=embedding_model_name
+            )
+            
+            if query_vec.ndim == 1:
+                query_vec = query_vec.reshape(1, -1)
+            if table_vecs.ndim == 1:
+                table_vecs = table_vecs.reshape(1, -1)
+            
+            # Normalize for cosine similarity
+            query_norm = query_vec / (np.linalg.norm(query_vec, axis=1, keepdims=True) + 1e-12)
+            table_norms = table_vecs / (np.linalg.norm(table_vecs, axis=1, keepdims=True) + 1e-12)
+            
+            scores = np.dot(table_norms, query_norm.T).reshape(-1)
+            
+            # Boost scores for direct string matches
+            lowered_query = user_query.lower()
+            for idx, info in enumerate(descriptors):
+                name = info["name"]
+                if name and name.lower() in lowered_query:
+                    scores[idx] += 0.2
+            
+            # Prepare ranking
+            table_ranking = []
+            for idx, info in enumerate(descriptors):
+                table_ranking.append({
+                    "name": info["name"],
+                    "score": float(scores[idx]),
+                    "text": info["text"]
+                })
+            
+            # Sort by score descending
+            table_ranking.sort(key=lambda item: item["score"], reverse=True)
+            
+            if not table_ranking:
+                raise ValueError("Empty table ranking after similarity scoring")
+            
+            top_score = table_ranking[0]["score"]
+            selected = []
+            context_chunks = []
+            
+            # If confidence is very low, include more tables to avoid missing important ones
+            score_threshold = max(top_score * 0.55, 0.15)
+            for item in table_ranking:
+                if len(selected) >= max_tables:
+                    break
+                if item["score"] >= score_threshold or len(selected) < 3:
+                    selected.append(item["name"])
+                    context_chunks.append(item["text"])
+            
+            # Safety: ensure at least 3 tables selected
+            if len(selected) < min(3, len(table_names)):
+                additional_needed = min(3, len(table_names)) - len(selected)
+                for item in table_ranking[len(selected):len(selected) + additional_needed]:
+                    selected.append(item["name"])
+                    context_chunks.append(item["text"])
+            
+            # Ensure uniqueness and preserve order
+            seen = set()
+            unique_selected = []
+            unique_chunks = []
+            for name, chunk in zip(selected, context_chunks):
+                lowered = name.lower()
+                if lowered not in seen:
+                    unique_selected.append(name)
+                    unique_chunks.append(chunk)
+                    seen.add(lowered)
+            
+            # Expand with related tables via foreign keys to avoid missing context
+            expanded_tables = list(unique_selected)
+            expanded_chunks = list(unique_chunks)
+            related_added = set(seen)
+
+            table_lookup = {
+                (table.get('name') or '').lower(): table for table in tables if table.get('name')
+            }
+
+            def add_table_if_present(table_name: Optional[str]):
+                if not table_name:
+                    return
+                lowered = table_name.lower()
+                if lowered in related_added:
+                    return
+                table_info = table_lookup.get(lowered)
+                if not table_info:
+                    return
+                expanded_tables.append(table_info.get('name'))
+                expanded_chunks.append(self._build_table_descriptor(table_info))
+                related_added.add(lowered)
+
+            for table_name in unique_selected:
+                table_info = table_lookup.get(table_name.lower())
+                if not table_info:
+                    continue
+                for fk in table_info.get('foreign_keys', []):
+                    add_table_if_present(fk.get('referred_table'))
+
+            for table in tables:
+                table_name = table.get('name')
+                if not table_name:
+                    continue
+                for fk in table.get('foreign_keys', []):
+                    referred = fk.get('referred_table')
+                    if referred and referred.lower() in seen:
+                        add_table_if_present(table_name)
+            
+            confidence = float(max(min(top_score, 1.0), 0.0))
+            reasoning = (
+                f"Selected tables based on semantic similarity between the user query and table schemas. "
+                f"Top score: {confidence:.2f}. Included at least three tables to avoid missing relevant data."
+            )
+            
+            result.update({
+                "selected_tables": expanded_tables[:max_tables + 4],
+                "confidence": confidence,
+                "reasoning": reasoning,
+                "selection_method": "embedding_similarity",
+                "table_context_chunks": expanded_chunks[:max_tables + 4],
+                "table_scores": [
+                    {"table": item["name"], "score": float(item["score"])}
+                    for item in table_ranking[:max_tables]
+                ]
+            })
+            return result
+        
+        except Exception as e:
+            print(f"[TableSelection] Error selecting tables via embeddings: {str(e)}")
+            # Fallback: include broader set of tables
+            fallback_tables = table_names[:max_tables]
+            fallback_chunks = [d["text"] for d in descriptors[:len(fallback_tables)]]
+
+            fallback_set = {name.lower() for name in fallback_tables}
+            table_lookup = {
+                (table.get('name') or '').lower(): table for table in tables if table.get('name')
+            }
+
+            def add_related_tables(base_tables: List[str]):
+                for base in list(base_tables):
+                    base_info = table_lookup.get(base.lower())
+                    if not base_info:
+                        continue
+                    for fk in base_info.get('foreign_keys', []):
+                        related_name = fk.get('referred_table')
+                        if related_name and related_name.lower() not in fallback_set:
+                            related_info = table_lookup.get(related_name.lower())
+                            if related_info:
+                                base_tables.append(related_info.get('name'))
+                                fallback_chunks.append(self._build_table_descriptor(related_info))
+                                fallback_set.add(related_name.lower())
+                # inbound relations
+                for table in tables:
+                    table_name = table.get('name')
+                    if not table_name or table_name.lower() in fallback_set:
+                        continue
+                    for fk in table.get('foreign_keys', []):
+                        referred = fk.get('referred_table')
+                        if referred and referred.lower() in fallback_set:
+                            base_tables.append(table_name)
+                            fallback_chunks.append(self._build_table_descriptor(table))
+                            fallback_set.add(table_name.lower())
+
+            add_related_tables(fallback_tables)
+            result.update({
+                "selected_tables": fallback_tables,
+                "confidence": 0.0,
+                "reasoning": "Failed to compute similarity scores; falling back to first tables.",
+                "selection_method": "fallback_limited",
+                "table_context_chunks": fallback_chunks
+            })
+            return result
+
+
 class NLToSQLAgent:
     """Agent to convert natural language queries to SQL"""
     
@@ -162,6 +430,8 @@ class NLToSQLAgent:
         collection_name: Optional[str] = None,
         embedding_model_name: Optional[str] = None,
         conversation_summary: Optional[str] = None,
+        selected_tables: Optional[List[str]] = None,
+        table_context_chunks: Optional[List[str]] = None,
         additional_guidance: Optional[str] = None
     ) -> Dict[str, Any]:
         """
@@ -219,6 +489,16 @@ class NLToSQLAgent:
                     doc_dist_pairs = list(zip(documents, metadatas, distances))
                     doc_dist_pairs.sort(key=lambda x: x[2])  # Sort by distance
                     
+                    # If table selection is available, prioritize chunks from selected tables
+                    if selected_tables:
+                        selected_lower = {t.lower() for t in selected_tables}
+                        filtered_pairs = [
+                            pair for pair in doc_dist_pairs
+                            if isinstance(pair[1], dict) and pair[1].get('table_name', '').lower() in selected_lower
+                        ]
+                        if filtered_pairs:
+                            doc_dist_pairs = filtered_pairs
+                    
                     # Use top results - take top 70% by distance, but at least top 5
                     threshold_index = max(5, int(len(doc_dist_pairs) * 0.7))
                     top_pairs = doc_dist_pairs[:max(max_results_to_use, threshold_index)]
@@ -242,6 +522,15 @@ class NLToSQLAgent:
         if not relevant_schema_text:
             schema_text = self._format_schema_for_llm(schema_details)
             relevant_schema_text = schema_text
+        
+        # Ensure table-specific context is included if provided
+        if table_context_chunks:
+            table_chunk_text = "\n\n".join(table_context_chunks)
+            if relevant_schema_text:
+                relevant_schema_text = table_chunk_text + "\n\n" + relevant_schema_text
+            else:
+                relevant_schema_text = table_chunk_text
+            relevant_schema_parts = (table_context_chunks or []) + (relevant_schema_parts or [])
         
         # Build enhanced schema context with structured metadata
         structured_schema_info = self._build_structured_schema_context(schema_details)
@@ -269,6 +558,12 @@ Database Type: {database_type.upper()}
             prompt += f"""
 === CONVERSATION CONTEXT (recent messages) ===
 {conversation_context_text}
+"""
+
+        if selected_tables:
+            prompt += f"""
+=== TABLES IDENTIFIED AS MOST RELEVANT ===
+{', '.join(selected_tables)}
 """
 
         if additional_guidance:
@@ -333,7 +628,8 @@ Respond in JSON format:
                         'reasoning': result.get('reasoning', ''),
                         'tables_used': result.get('tables_used', []),
                         'columns_used': result.get('columns_used', []),
-                        'relevant_schema_parts': relevant_schema_parts
+                        'relevant_schema_parts': relevant_schema_parts,
+                        'selected_tables': selected_tables or []
                     }
                 except json.JSONDecodeError:
                     # Try to extract SQL directly
@@ -345,7 +641,8 @@ Respond in JSON format:
                             'reasoning': 'Extracted from response',
                             'tables_used': [],
                             'columns_used': [],
-                            'relevant_schema_parts': relevant_schema_parts
+                            'relevant_schema_parts': relevant_schema_parts,
+                            'selected_tables': selected_tables or []
                         }
         except Exception as e:
             print(f"[NLToSQL] Error: {str(e)}")
@@ -356,7 +653,8 @@ Respond in JSON format:
             'reasoning': 'Failed to generate SQL',
             'tables_used': [],
             'columns_used': [],
-            'relevant_schema_parts': relevant_schema_parts
+            'relevant_schema_parts': relevant_schema_parts,
+            'selected_tables': selected_tables or []
         }
     
     def _build_structured_schema_context(self, schema_details: Dict[str, Any]) -> str:
@@ -666,17 +964,27 @@ class DatabaseAgentSystem:
     def __init__(self, llm_service: LLMService, schema_service: DatabaseSchemaService,
                  embedding_service: Optional[EmbeddingService] = None,
                  chromadb_service: Optional[ChromaDBService] = None,
-                 model_config: Optional[Dict] = None):
+                 model_config: Optional[Dict] = None,
+                 enable_table_selection: bool = True):
         self.llm_service = llm_service
         self.embedding_service = embedding_service
         self.chromadb_service = chromadb_service
         self.model_config = model_config or {}
+        enable_selection_flag = enable_table_selection
+        if isinstance(self.model_config, dict):
+            enable_selection_flag = self.model_config.get("enable_table_selection", enable_table_selection)
+        self.enable_table_selection = bool(enable_selection_flag and embedding_service)
         self.intent_agent = IntentDetectionAgent(
             llm_service, 
             embedding_service, 
             chromadb_service, 
             model_config
         )
+        self.table_selection_agent = TableSelectionAgent(
+            llm_service,
+            embedding_service,
+            model_config
+        ) if self.enable_table_selection else None
         self.nl_to_sql_agent = NLToSQLAgent(
             llm_service, 
             embedding_service, 
@@ -718,7 +1026,8 @@ class DatabaseAgentSystem:
             'sql_validation': None,
             'should_execute': False,
             'chat_response': None,
-            'relevant_schema_parts': []
+            'relevant_schema_parts': [],
+            'table_selection': None
         }
         
         # Step 1: Detect intent using semantic search
@@ -754,6 +1063,21 @@ class DatabaseAgentSystem:
             result['chat_response'] = chat_response
             return result
         
+        # Step 2a: Identify relevant tables using table selection agent (if enabled)
+        selected_tables_info = None
+        selected_tables = None
+        table_context_chunks = None
+        
+        if self.enable_table_selection and self.table_selection_agent:
+            selected_tables_info = self.table_selection_agent.select_tables(
+                user_query=user_query,
+                schema_details=schema_details,
+                embedding_model_name=embedding_model_name
+            )
+            selected_tables = selected_tables_info.get('selected_tables') if selected_tables_info else None
+            table_context_chunks = selected_tables_info.get('table_context_chunks') if selected_tables_info else None
+            result['table_selection'] = selected_tables_info
+        
         # Step 2b: Generate SQL using semantic search for relevant schema parts
         result['requires_sql'] = True
         sql_result = self.nl_to_sql_agent.generate_sql(
@@ -762,10 +1086,16 @@ class DatabaseAgentSystem:
             database_type,
             collection_name=collection_name,
             embedding_model_name=embedding_model_name,
-            conversation_summary=conversation_summary
+            conversation_summary=conversation_summary,
+            selected_tables=selected_tables,
+            table_context_chunks=table_context_chunks
         )
         result['sql'] = sql_result.get('sql')
         result['relevant_schema_parts'] = sql_result.get('relevant_schema_parts', [])
+        if not selected_tables and sql_result.get('selected_tables'):
+            selected_tables = sql_result.get('selected_tables')
+        if result['table_selection'] and not result['table_selection'].get('selected_tables') and selected_tables:
+            result['table_selection']['selected_tables'] = selected_tables
         
         if not result['sql']:
             # Failed to generate SQL, provide helpful response
@@ -809,6 +1139,8 @@ class DatabaseAgentSystem:
                     collection_name=collection_name,
                     embedding_model_name=embedding_model_name,
                     conversation_summary=summary_for_refinement,
+                    selected_tables=selected_tables,
+                    table_context_chunks=table_context_chunks,
                     additional_guidance=guidance_text
                 )
                 

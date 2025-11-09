@@ -1768,6 +1768,13 @@ async def database_chat(
             "relevant_schema_parts_count": len(relevant_schema_parts),
             "used_semantic_search": len(relevant_schema_parts) > 0
         }
+        table_selection_info = agent_result.get('table_selection') or {}
+        metadata["table_selection"] = {
+            "enabled": bool(table_selection_info),
+            "selected_tables": table_selection_info.get('selected_tables', []),
+            "confidence": table_selection_info.get('confidence'),
+            "method": table_selection_info.get('selection_method')
+        }
         
         # If SQL should be executed
         if agent_result.get('should_execute') and agent_result.get('sql'):
@@ -1978,9 +1985,16 @@ async def database_chat(
             "metadata": {
                 "intent": metadata.get('intent', {}),
                 "used_semantic_search": metadata.get('used_semantic_search', False),
-                "relevant_schema_parts_count": metadata.get('relevant_schema_parts_count', 0)
+                "relevant_schema_parts_count": metadata.get('relevant_schema_parts_count', 0),
+                "table_selection": metadata.get('table_selection')
             }
         }
+        if table_selection_info:
+            response_data["table_selection"] = {
+                "selected_tables": table_selection_info.get('selected_tables', []),
+                "confidence": table_selection_info.get('confidence'),
+                "method": table_selection_info.get('selection_method')
+            }
         
         # Only include SQL in response if execution was successful
         if sql_executed and query_result and query_result.get('success'):

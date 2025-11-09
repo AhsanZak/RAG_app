@@ -17,7 +17,8 @@ import {
   Tabs,
   Upload,
   Spin,
-  Tooltip
+  Tooltip,
+  Collapse
 } from 'antd';
 import {
   DatabaseOutlined,
@@ -78,6 +79,7 @@ const DatabaseChat = ({ onBack }) => {
   const [knowledgeDescription, setKnowledgeDescription] = useState('');
   const [knowledgeFileList, setKnowledgeFileList] = useState([]);
   const [knowledgeUploading, setKnowledgeUploading] = useState(false);
+  const [isProcessingMessage, setIsProcessingMessage] = useState(false);
   const [activeTab, setActiveTab] = useState('chat');
   const { Dragger } = Upload;
 
@@ -140,6 +142,192 @@ const DatabaseChat = ({ onBack }) => {
     sqlite: null, // SQLite doesn't use a port
     oracle: 1521,
     mssql: 1433
+  };
+
+  const buildProcessTrace = ({
+    metadata = {},
+    response = {},
+    sql,
+    sqlExecuted,
+    queryResultCount
+  } = {}) => {
+    const intent = metadata.intent || {};
+    const intentType = intent.intent_type || (metadata.requires_sql ? 'sql_query' : 'general_chat');
+    const requiresSql = response.requires_sql ?? metadata.requires_sql ?? intent.requires_sql ?? false;
+    const tableSelectionData =
+      response.table_selection ||
+      metadata.table_selection ||
+      {};
+    const sqlValidation = metadata.sql_validation || {};
+
+    const formatConfidence = (value) => {
+      if (typeof value !== 'number' || Number.isNaN(value)) return undefined;
+      return Math.round(value * 100);
+    };
+
+    const selectedTables = Array.isArray(tableSelectionData.selected_tables)
+      ? tableSelectionData.selected_tables
+      : [];
+
+    return {
+      intentType,
+      intentConfidence: formatConfidence(intent.confidence),
+      requiresSql: Boolean(requiresSql),
+      semanticSearchUsed: metadata.used_semantic_search ?? false,
+      relevantSchemaChunks: metadata.relevant_schema_parts_count ?? null,
+      tableSelection: {
+        enabled: selectedTables.length > 0,
+        selectedTables,
+        confidence: formatConfidence(tableSelectionData.confidence),
+        method: tableSelectionData.method || tableSelectionData.selection_method || null
+      },
+      sqlGenerated: Boolean(sql),
+      sqlExecuted: Boolean(sqlExecuted),
+      queryResultCount: typeof queryResultCount === 'number' ? queryResultCount : undefined,
+      validatedTables: sqlValidation.validated_tables || [],
+      validatedColumns: sqlValidation.validated_columns || [],
+      warnings: sqlValidation.warnings || [],
+      errors: sqlValidation.errors || []
+    };
+  };
+
+  const renderProcessTrace = (trace) => {
+    if (!trace) return null;
+
+    const printConfidence = (value) => (typeof value === 'number' ? `${value}%` : null);
+
+    return (
+      <Collapse size="small" ghost style={{ marginTop: 12 }}>
+        <Collapse.Panel header="Process Trace" key="trace-panel">
+          <Space direction="vertical" size={6} style={{ width: '100%' }}>
+            <div>
+              <Text strong>Intent:</Text>{' '}
+              <Tag color={trace.requiresSql ? 'volcano' : 'blue'}>
+                {trace.intentType || 'unknown'}
+              </Tag>
+              {typeof trace.intentConfidence === 'number' && (
+                <Text type="secondary" style={{ marginLeft: 8 }}>
+                  Confidence {trace.intentConfidence}%
+                </Text>
+              )}
+            </div>
+
+            <div>
+              <Text strong>SQL Required:</Text>{' '}
+              <Tag color={trace.requiresSql ? 'red' : 'green'}>
+                {trace.requiresSql ? 'Yes' : 'No'}
+              </Tag>
+            </div>
+
+            <div>
+              <Text strong>Semantic Search:</Text>{' '}
+              <Tag color={trace.semanticSearchUsed ? 'purple' : 'default'}>
+                {trace.semanticSearchUsed ? 'Used enriched schema vectors' : 'Not used'}
+              </Tag>
+              {typeof trace.relevantSchemaChunks === 'number' && (
+                <Text type="secondary" style={{ marginLeft: 8 }}>
+                  {trace.relevantSchemaChunks} chunks
+                </Text>
+              )}
+            </div>
+
+            <div>
+              <Text strong>Table Selection:</Text>{' '}
+              <Tag color={trace.tableSelection?.enabled ? 'geekblue' : 'default'}>
+                {trace.tableSelection?.enabled ? 'Enabled' : 'Not triggered'}
+              </Tag>
+              {trace.tableSelection?.method && (
+                <Text type="secondary" style={{ marginLeft: 8 }}>
+                  {trace.tableSelection.method}
+                </Text>
+              )}
+              {trace.tableSelection?.confidence !== undefined && (
+                <Text type="secondary" style={{ marginLeft: 8 }}>
+                  Confidence {printConfidence(trace.tableSelection.confidence)}
+                </Text>
+              )}
+              {trace.tableSelection?.selectedTables?.length > 0 && (
+                <Space size={[4, 4]} wrap style={{ marginTop: 4 }}>
+                  {trace.tableSelection.selectedTables.map((table) => (
+                    <Tag key={table} color="blue">
+                      {table}
+                    </Tag>
+                  ))}
+                </Space>
+              )}
+            </div>
+
+            <div>
+              <Text strong>SQL Generation:</Text>{' '}
+              <Tag color={trace.sqlGenerated ? 'processing' : 'default'}>
+                {trace.sqlGenerated ? 'Generated' : 'Not needed'}
+              </Tag>
+              <Text strong style={{ marginLeft: 12 }}>Execution:</Text>{' '}
+              <Tag color={trace.sqlExecuted ? 'processing' : 'default'}>
+                {trace.sqlExecuted ? 'Executed' : 'Skipped'}
+              </Tag>
+              {typeof trace.queryResultCount === 'number' && (
+                <Text type="secondary" style={{ marginLeft: 8 }}>
+                  {trace.queryResultCount} rows
+                </Text>
+              )}
+            </div>
+
+            {trace.validatedTables?.length > 0 && (
+              <div>
+                <Text strong>Validated Tables:</Text>
+                <Space size={[4, 4]} wrap style={{ marginTop: 4 }}>
+                  {trace.validatedTables.map((table) => (
+                    <Tag key={table} color="cyan">
+                      {table}
+                    </Tag>
+                  ))}
+                </Space>
+              </div>
+            )}
+
+            {trace.validatedColumns?.length > 0 && (
+              <div>
+                <Text strong>Validated Columns:</Text>
+                <Space size={[4, 4]} wrap style={{ marginTop: 4 }}>
+                  {trace.validatedColumns.map((column) => (
+                    <Tag key={column} color="gold">
+                      {column}
+                    </Tag>
+                  ))}
+                </Space>
+              </div>
+            )}
+
+            {trace.warnings?.length > 0 && (
+              <div>
+                <Text strong>Warnings:</Text>
+                <Space direction="vertical" size={2} style={{ marginTop: 4 }}>
+                  {trace.warnings.map((warn, index) => (
+                    <Text type="warning" key={`warn-${index}`}>
+                      • {warn}
+                    </Text>
+                  ))}
+                </Space>
+              </div>
+            )}
+
+            {trace.errors?.length > 0 && (
+              <div>
+                <Text strong>Errors:</Text>
+                <Space direction="vertical" size={2} style={{ marginTop: 4 }}>
+                  {trace.errors.map((err, index) => (
+                    <Text type="danger" key={`err-${index}`}>
+                      • {err}
+                    </Text>
+                  ))}
+                </Space>
+              </div>
+            )}
+          </Space>
+        </Collapse.Panel>
+      </Collapse>
+    );
   };
 
   useEffect(() => {
@@ -481,6 +669,18 @@ const DatabaseChat = ({ onBack }) => {
           : queryData.length;
         const sql = metadata.sql;
         const sqlExecuted = Boolean(sql) && (rowCount > 0 || queryData.length > 0);
+        const processTrace = msg.role === 'assistant'
+          ? buildProcessTrace({
+              metadata,
+              response: {
+                table_selection: metadata.table_selection,
+                requires_sql: metadata.requires_sql
+              },
+              sql,
+              sqlExecuted,
+              queryResultCount: rowCount
+            })
+          : null;
 
         return {
           id: msg.id,
@@ -493,6 +693,7 @@ const DatabaseChat = ({ onBack }) => {
           queryResult: queryData,
           queryResultCount: rowCount,
           queryResultColumns: queryColumns,
+          processTrace,
         };
       });
       setChatMessages(formattedMessages);
@@ -725,6 +926,7 @@ const DatabaseChat = ({ onBack }) => {
     setChatMessages(prev => [...prev, userMessage]);
     setInputValue('');
 
+    setIsProcessingMessage(true);
     try {
       const response = await databaseChatAPI.chat(
         currentSession.id,
@@ -762,6 +964,14 @@ const DatabaseChat = ({ onBack }) => {
         queryResultColumns = Object.keys(queryResultArray[0]);
       }
 
+      const processTrace = buildProcessTrace({
+        metadata: response.metadata || {},
+        response,
+        sql: response.sql,
+        sqlExecuted: response.sql_executed || false,
+        queryResultCount: response.query_result_count || queryResultArray.length
+      });
+
       const assistantResponse = {
         id: response.message_id || Date.now() + 1,
         role: 'assistant',
@@ -773,7 +983,8 @@ const DatabaseChat = ({ onBack }) => {
         queryResult: queryResultArray,
         queryResultCount: response.query_result_count || queryResultArray.length,
         queryResultColumns: queryResultColumns,
-        metadata: response.metadata || {}
+        metadata: response.metadata || {},
+        processTrace
       };
 
       console.log('=== Processed Assistant Response ===');
@@ -784,6 +995,7 @@ const DatabaseChat = ({ onBack }) => {
       console.log('===================================');
       
       setChatMessages(prev => [...prev, assistantResponse]);
+      setIsProcessingMessage(false);
       
       // Reload sessions to update message count
       if (currentConnection) {
@@ -795,6 +1007,7 @@ const DatabaseChat = ({ onBack }) => {
       
       // Remove user message on error
       setChatMessages(prev => prev.filter(m => m.id !== userMessage.id));
+      setIsProcessingMessage(false);
     }
 
     inputRef.current?.focus();
@@ -1045,6 +1258,29 @@ const DatabaseChat = ({ onBack }) => {
             marginBottom: 16,
           }}
         >
+          {isProcessingMessage && (
+            <Card
+              size="small"
+              bordered={false}
+              style={{
+                marginBottom: 12,
+                background: '#f6ffed',
+                border: '1px solid #b7eb8f'
+              }}
+            >
+              <Space align="start">
+                <Spin
+                  indicator={<LoadingOutlined style={{ fontSize: 18, color: '#389e0d' }} spin />}
+                />
+                <div>
+                  <Text strong>Working on your request…</Text>
+                  <Paragraph style={{ marginBottom: 0, marginTop: 4 }}>
+                    Detecting intent → Selecting relevant tables → Generating SQL → Executing query (if needed)
+                  </Paragraph>
+                </div>
+              </Space>
+            </Card>
+          )}
           {chatMessages.length === 0 ? (
             <div className="empty-messages-state">
               <RobotOutlined style={{ fontSize: '48px', color: '#d9d9d9', marginBottom: 16 }} />
@@ -1068,6 +1304,8 @@ const DatabaseChat = ({ onBack }) => {
                     <div className="message-bubble">
                       <Markdown>{message.content}</Markdown>
                       
+                      {message.role === 'assistant' && message.processTrace && renderProcessTrace(message.processTrace)}
+
                       {message.sql && (
                         <div style={{ marginTop: 12, padding: 8, background: '#f5f5f5', borderRadius: 4 }}>
                           <Text strong style={{ fontSize: '12px' }}>SQL Query:</Text>
