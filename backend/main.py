@@ -1809,6 +1809,21 @@ async def process_database_schema(
 
         preview_text = schema_text[:2000] if schema_text else "Schema processed successfully"
 
+        if preview_text and preview_text.strip():
+            summary_message = ChatMessageModel(
+                session_id=session.id,
+                role="assistant",
+                message=preview_text,
+                meta_data={
+                    "summary": True,
+                    "schema_processed": True,
+                    "timestamp": datetime.utcnow().isoformat()
+                },
+                created_at=datetime.utcnow()
+            )
+            db.add(summary_message)
+            db.commit()
+
         return {
             "success": True,
             "session_id": session.id,
@@ -1967,39 +1982,27 @@ async def database_chat(
             "api_key": model.api_key if hasattr(model, 'api_key') else None
         }
         
-        # Get database connection and schema
+        # Locate the schema for this session
         schema = (
             db.query(DatabaseSchema)
-            .filter(
-                DatabaseSchema.connection_id == connection_id,
-                DatabaseSchema.session_id.is_(None)
-            )
-            .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
+            .filter(DatabaseSchema.session_id == session_id)
             .first()
         )
         if not schema:
-            schema = (
-                db.query(DatabaseSchema)
-                .filter(DatabaseSchema.connection_id == connection_id)
-                .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
-                .first()
-            )
-        
-        if not schema:
-            raise HTTPException(status_code=404, detail="Schema not found")
-        
-        if not schema.is_processed:
-            raise HTTPException(
-                status_code=400,
-                detail="This session has not been processed yet. Process & vectorize the schema before chatting."
-            )
-        
+            raise HTTPException(status_code=404, detail="Schema not found for this session")
+
         connection = db.query(DatabaseConnection).filter(
             DatabaseConnection.id == schema.connection_id
         ).first()
         if not connection:
             raise HTTPException(status_code=404, detail="Database connection not found")
         connection_id = connection.id
+
+        if not schema.is_processed:
+            raise HTTPException(
+                status_code=400,
+                detail="This session has not been processed yet. Process & vectorize the schema before chatting."
+            )
         
         # Ensure the session has a vector store; rebuild if needed
         collection_name = f"db_session_{session_id}"

@@ -904,6 +904,30 @@ const DatabaseChat = ({ onBack }) => {
           result.preview?.summary ||
           `${result.total_chunks || 0} schema chunks have been vectorized. You can now chat!`;
 
+        if (successSummary) {
+          setChatMessages(prev => {
+            const alreadyPresent = prev.some(
+              msg => msg.metadata?.summary && msg.content === successSummary
+            );
+            if (alreadyPresent) {
+              return prev;
+            }
+            return [
+              ...prev,
+              {
+                id: `summary_${Date.now()}`,
+                role: 'assistant',
+                content: successSummary,
+                timestamp: new Date(),
+                metadata: {
+                  summary: true,
+                  schema_processed: true
+                }
+              }
+            ];
+          });
+        }
+
         Modal.success({
           title: 'Schema Processed Successfully',
           content: successSummary,
