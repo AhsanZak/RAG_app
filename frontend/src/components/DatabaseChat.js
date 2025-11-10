@@ -557,19 +557,30 @@ const DatabaseChat = ({ onBack }) => {
       }
       
       // If there's a current session and it's in the list, keep it selected
-      // Otherwise, select the most recent session
+      // Otherwise, select the most appropriate session (prefer processed)
       if (dbSessions.length > 0) {
         const existingSession = dbSessions.find(s => s.id === currentSession?.id);
         if (existingSession) {
           setCurrentSession(existingSession);
           await handleSelectSession(existingSession);
         } else {
-          // Select the most recent session
-          const mostRecent = dbSessions.sort((a, b) => 
-            new Date(b.created_at) - new Date(a.created_at)
-          )[0];
-          setCurrentSession(mostRecent);
-          await handleSelectSession(mostRecent);
+          const readySessions = dbSessions.filter(s => s.hasVectorizedData);
+          let sessionToSelect = null;
+
+          if (readySessions.length > 0) {
+            sessionToSelect = readySessions
+              .slice()
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+          } else {
+            sessionToSelect = dbSessions
+              .slice()
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+          }
+
+          if (sessionToSelect) {
+            setCurrentSession(sessionToSelect);
+            await handleSelectSession(sessionToSelect);
+          }
         }
       } else {
         setCurrentSession(null);
@@ -589,7 +600,7 @@ const DatabaseChat = ({ onBack }) => {
       return;
     }
     if (!schemaData || !schemaData.schema_data) {
-      message.warning('Extract and process the schema before creating a new session');
+      message.warning('Extract the schema before creating a new session');
       return;
     }
     if (!selectedModel) {
@@ -614,6 +625,7 @@ const DatabaseChat = ({ onBack }) => {
       });
 
       message.success('New session created');
+      message.info('Process the schema for this session before chatting.');
 
       const sessionsData = await databaseChatAPI.getSessions(1, currentConnection.id);
       const dbSessions = sessionsData.filter(s => s.session_type === 'database');
@@ -783,11 +795,7 @@ const DatabaseChat = ({ onBack }) => {
       const schema = await databaseChatAPI.getSchema(connection.id);
       if (schema && schema.schema_data) {
         setSchemaData(schema);
-        // Check if schema has a session_id (processed schema)
-        if (schema.session_id) {
-          // Load sessions for this connection
-          await loadSessions(connection.id);
-        }
+        await loadSessions(connection.id);
       } else {
         setSchemaData(null);
         setSessions([]);
@@ -852,9 +860,13 @@ const DatabaseChat = ({ onBack }) => {
 
     setProcessingSchema(true);
     try {
-      const sessionName = `${currentConnection.name} - Schema`;
+      const targetSessionId = currentSession?.id || null;
+      const sessionName =
+        currentSession?.name || `${currentConnection.name} - Session ${new Date().toLocaleString()}`;
+
       const result = await databaseChatAPI.processSchema({
         connection_id: currentConnection.id,
+        session_id: targetSessionId || undefined,
         session_name: sessionName,
         llm_model_id: selectedModel,
         embedding_model_name: selectedEmbeddingModelName || 'all-MiniLM-L6-v2',
@@ -862,43 +874,39 @@ const DatabaseChat = ({ onBack }) => {
       });
 
       if (result.success) {
-        // Reload sessions to get the new session with all details
         const sessionsData = await databaseChatAPI.getSessions(1, currentConnection.id);
         const dbSessions = sessionsData.filter(s => s.session_type === 'database');
         setSessions(dbSessions);
-        
-        // Find the newly created session
-        const newSession = dbSessions.find(s => s.id === result.session_id) || {
-          id: result.session_id,
-          name: sessionName,
-          createdAt: new Date(),
-          status: 'ready',
-          hasVectorizedData: true,
-          session_type: 'database',
-          connection_id: currentConnection.id,
-          message_count: 0
-        };
-        
-        setCurrentSession(newSession);
-        setSessionReady(true);
-        
-        // Load messages for the new session (will be empty initially)
-        await handleSelectSession(newSession);
-        
-        // Inject preview as first assistant message if available
-        if (result.preview && result.preview.summary) {
-          const assistantPreview = {
-            id: `preview_${Date.now()}`,
-            role: 'assistant',
-            content: result.preview.summary,
-            timestamp: new Date()
-          };
-          setChatMessages(prev => [assistantPreview, ...prev]);
+
+        const processedSessionId =
+          (result.session && result.session.id) || result.session_id || targetSessionId;
+
+        const processedSession = dbSessions.find(s => s.id === processedSessionId) || null;
+
+        if (processedSession) {
+          setCurrentSession(processedSession);
+          setSessionReady(processedSession.hasVectorizedData || false);
+          await handleSelectSession(processedSession);
+        } else if (dbSessions.length > 0) {
+          const fallbackSession = dbSessions
+            .slice()
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+          setCurrentSession(fallbackSession);
+          setSessionReady(fallbackSession.hasVectorizedData || false);
+          await handleSelectSession(fallbackSession);
+        } else {
+          setCurrentSession(null);
+          setSessionReady(false);
+          setChatMessages([]);
         }
+
+        const successSummary =
+          result.preview?.summary ||
+          `${result.total_chunks || 0} schema chunks have been vectorized. You can now chat!`;
 
         Modal.success({
           title: 'Schema Processed Successfully',
-          content: `${result.total_chunks} schema chunks have been vectorized. You can now start chatting!`,
+          content: successSummary,
         });
       }
     } catch (error) {

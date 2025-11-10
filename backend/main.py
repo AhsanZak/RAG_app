@@ -301,6 +301,92 @@ def _build_condensed_chat_summary(
         summary_text = summary_text[: max_chars - 3] + "..."
     return summary_text
 
+def _vectorize_schema_for_session(
+    db_session: Session,
+    session: ChatSession,
+    schema_record: DatabaseSchema,
+    connection: DatabaseConnection,
+    embedding_model_name: Optional[str] = None
+) -> bool:
+    """Ensure a session has an up-to-date vector store for its schema."""
+    if not schema_record or not schema_record.schema_data:
+        return False
+
+    schema_data = copy.deepcopy(schema_record.schema_data or {})
+    schema_text = schema_record.schema_text or ""
+
+    if embedding_model_name and not get_embedding_model_info(embedding_model_name):
+        embedding_model_name = None
+    if not embedding_model_name:
+        # Try to read embedding model from schema metadata, fall back to default
+        meta_block = None
+        if isinstance(schema_data, dict):
+            meta_block = schema_data.get("_meta") or schema_data.get("meta")
+        if isinstance(meta_block, dict):
+            embedding_model_name = meta_block.get("embedding_model")
+    if embedding_model_name and not get_embedding_model_info(embedding_model_name):
+        embedding_model_name = None
+    if not embedding_model_name:
+        embedding_model_name = get_default_embedding_model()
+
+    collection_name = f"db_session_{session.id}"
+    try:
+        existing_collections = chromadb_service.list_collections()
+    except Exception:
+        existing_collections = []
+
+    try:
+        if collection_name in existing_collections:
+            chromadb_service.delete_collection(collection_name)
+    except Exception as cleanup_error:
+        print(f"[SchemaVectors] Unable to clear existing collection '{collection_name}': {cleanup_error}")
+
+    chunks = _create_enriched_schema_chunks(schema_data, schema_text)
+    if not chunks:
+        return False
+
+    all_texts = [chunk.get("text") for chunk in chunks if chunk.get("text")]
+    if not all_texts:
+        return False
+
+    embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+
+    all_metadatas = []
+    all_ids = []
+    for idx, chunk in enumerate(chunks):
+        text = chunk.get("text")
+        if not text:
+            continue
+        metadata = dict(chunk.get("metadata") or {})
+        metadata["session_id"] = str(session.id)
+        metadata["connection_id"] = str(connection.id)
+        metadata["chunk_index"] = idx
+        all_metadatas.append(metadata)
+        all_ids.append(f"schema_{connection.id}_{session.id}_{idx}")
+
+    chromadb_service.add_documents(
+        collection_name=collection_name,
+        texts=all_texts,
+        embeddings=embeddings,
+        metadatas=all_metadatas,
+        ids=all_ids
+    )
+
+    # Update schema metadata and flags
+    if isinstance(schema_data, dict):
+        meta_block = schema_data.setdefault("_meta", {})
+        if isinstance(meta_block, dict):
+            meta_block["embedding_model"] = embedding_model_name
+            meta_block["vectorized_at"] = datetime.utcnow().isoformat()
+        schema_record.schema_data = schema_data
+
+    schema_record.is_processed = 1
+    schema_record.session_id = session.id
+    schema_record.updated_at = datetime.utcnow()
+    db_session.commit()
+
+    return True
+
 from services.pdf_processor import PDFProcessor
 from services.embedding_service import EmbeddingService
 from services.chromadb_service import ChromaDBService
@@ -1183,20 +1269,37 @@ async def get_sessions(
         schema = db.query(DatabaseSchema).filter(DatabaseSchema.session_id == s.id).first()
         
         if schema:
-            # Database session - use db_session_ prefix
             collection_name = f"db_session_{s.id}"
             session_type = "database"
+            has_vectorized_data = collection_name in existing_collections
+
+            if schema.is_processed and not has_vectorized_data:
+                connection = db.query(DatabaseConnection).filter(DatabaseConnection.id == schema.connection_id).first()
+                if connection:
+                    try:
+                        rebuilt = _vectorize_schema_for_session(
+                            db,
+                            s,
+                            schema,
+                            connection,
+                            embedding_model_name=None
+                        )
+                        if rebuilt:
+                            existing_collections = chromadb_service.list_collections()
+                            has_vectorized_data = collection_name in existing_collections
+                    except Exception as ensure_err:
+                        print(f"[SESSIONS] Failed to rebuild vectors for session {s.id}: {ensure_err}")
         else:
             # PDF/Excel sessions use session_ prefix
             collection_name = f"session_{s.id}"
             session_type = "pdf"
-            
+
             # Try to determine if this session belongs to Excel chat based on metadata
             if collection_name in existing_collections:
                 try:
                     sample = chromadb_service.peek_collection(collection_name, n_results=3)
                     metadata_entries = sample.get("metadatas") or []
-                    
+
                     # Flatten metadata lists and keep dicts only
                     flattened_metadata = []
                     for item in metadata_entries:
@@ -1204,7 +1307,7 @@ async def get_sessions(
                             flattened_metadata.append(item)
                         elif isinstance(item, list):
                             flattened_metadata.extend([meta for meta in item if isinstance(meta, dict)])
-                    
+
                     def is_excel_metadata(meta: Dict) -> bool:
                         filename = meta.get("filename", "")
                         sheet_name = meta.get("sheet_name")
@@ -1214,14 +1317,14 @@ async def get_sessions(
                             or bool(sheet_name)
                             or (isinstance(filename, str) and filename.lower().endswith((".xlsx", ".xls", ".xlsm")))
                         )
-                    
+
                     if any(is_excel_metadata(meta) for meta in flattened_metadata):
                         session_type = "excel"
                 except Exception as e:
                     print(f"[SESSIONS] Could not inspect collection '{collection_name}' metadata: {e}")
-        
-        has_vectorized_data = collection_name in existing_collections
-        
+
+            has_vectorized_data = collection_name in existing_collections
+
         result.append({
             "id": s.id,
             "name": s.session_name,
@@ -1543,78 +1646,155 @@ async def process_database_schema(
     session_data: dict,
     db: Session = Depends(get_db)
 ):
-    """Process schema and create ChromaDB collection"""
+    """Process a database schema for a specific session and build its vector store."""
     try:
         connection_id = session_data.get("connection_id")
         user_id = session_data.get("user_id", 1)
-        session_name = session_data.get("session_name", "New Session")
-        
+        target_session_id = session_data.get("session_id")
+        requested_llm_model_id = session_data.get("llm_model_id")
+
         if not connection_id:
             raise HTTPException(status_code=400, detail="connection_id is required")
-        
-        # Get schema from database
-        schema = db.query(DatabaseSchema).filter(
-            DatabaseSchema.connection_id == connection_id
-        ).first()
-        
-        if not schema:
-            raise HTTPException(status_code=404, detail="Schema not found. Please extract schema first.")
-        
-        # Create or get session
-        embedding_model_name = session_data.get("embedding_model_name")
-        if not embedding_model_name:
-            # Use a better default for database schema - prefer BGE models for NL-to-SQL accuracy
-            default_models = ["BAAI/bge-large-en-v1.5", "BAAI/bge-base-en", "sentence-transformers/all-mpnet-base-v2"]
-            embedding_model_name = get_default_embedding_model()
-            # Try to use a better model if available, otherwise fall back to default
-            try:
-                # Check if BGE models are available in the embedding models list
-                model_info = get_embedding_model_info("BAAI/bge-base-en")
-                if model_info:
-                    embedding_model_name = "BAAI/bge-base-en"  # Use BGE base as it's good balance
-            except:
-                pass  # Use default if better model not available
-        
-        session = ChatSession(
-            user_id=user_id,
-            session_name=session_name,
-            llm_model_id=session_data.get("llm_model_id", 1),
-            embedding_model_id=None,
-            created_at=datetime.utcnow()
+
+        # Determine the base schema (session_id is NULL)
+        base_schema = (
+            db.query(DatabaseSchema)
+            .filter(
+                DatabaseSchema.connection_id == connection_id,
+                DatabaseSchema.session_id.is_(None)
+            )
+            .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
+            .first()
         )
-        db.add(session)
+
+        if not base_schema:
+            # Fallback for legacy data – use the most recent schema regardless of session binding
+            base_schema = (
+                db.query(DatabaseSchema)
+                .filter(DatabaseSchema.connection_id == connection_id)
+                .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
+                .first()
+            )
+
+        if not base_schema or not base_schema.schema_data:
+            raise HTTPException(
+                status_code=404,
+                detail="Schema not found. Please extract and save the schema before processing."
+            )
+
+        schema_data = copy.deepcopy(base_schema.schema_data or {})
+        schema_text = base_schema.schema_text or ""
+
+        # Resolve embedding model to use
+        embedding_model_name = session_data.get("embedding_model_name")
+        if embedding_model_name and not get_embedding_model_info(embedding_model_name):
+            embedding_model_name = None
+        if not embedding_model_name:
+            embedding_model_name = get_default_embedding_model()
+
+        # Resolve LLM model ID
+        llm_model_id = requested_llm_model_id
+        session: Optional[ChatSession] = None
+        session_created = False
+
+        if target_session_id:
+            session = db.query(ChatSession).filter(ChatSession.id == target_session_id).first()
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if not llm_model_id:
+                llm_model_id = session.llm_model_id
+        else:
+            session_name = session_data.get(
+                "session_name",
+                f"Database Session {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            session = ChatSession(
+                user_id=user_id,
+                session_name=session_name,
+                llm_model_id=session_data.get("llm_model_id", 1),
+                embedding_model_id=None,
+                created_at=datetime.utcnow()
+            )
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+            session_created = True
+            if not llm_model_id:
+                llm_model_id = session.llm_model_id
+
+        if not llm_model_id:
+            default_llm = (
+                db.query(LLMModel)
+                .filter(LLMModel.is_active == 1)
+                .order_by(LLMModel.id)
+                .first()
+            ) or db.query(LLMModel).order_by(LLMModel.id).first()
+            if not default_llm:
+                raise HTTPException(status_code=400, detail="No LLM models are configured. Add an LLM model first.")
+            llm_model_id = default_llm.id
+            if session_created:
+                session.llm_model_id = llm_model_id
+                db.commit()
+
+        if session.llm_model_id != llm_model_id:
+            session.llm_model_id = llm_model_id
+            db.commit()
+
+        # Ensure there is a schema record bound to this session
+        session_schema = (
+            db.query(DatabaseSchema)
+            .filter(
+                DatabaseSchema.connection_id == connection_id,
+                DatabaseSchema.session_id == session.id
+            )
+            .first()
+        )
+
+        if not session_schema:
+            session_schema = DatabaseSchema(
+                connection_id=connection_id,
+                session_id=session.id,
+                schema_data=schema_data,
+                schema_text=schema_text,
+                is_processed=0,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.add(session_schema)
+        else:
+            session_schema.schema_data = schema_data
+            session_schema.schema_text = schema_text
+            session_schema.is_processed = 0
+            session_schema.updated_at = datetime.utcnow()
         db.commit()
-        db.refresh(session)
-        
-        # Collection name based on session ID
+
         collection_name = f"db_session_{session.id}"
-        
-        # Prepare schema data and text
-        schema_data = schema.schema_data or {}
-        schema_text = schema.schema_text or ""
-        
-        # Create enriched schema chunks with synonyms and better descriptions
+
+        # Clear existing vectors for this session (if any)
+        try:
+            existing_collections = chromadb_service.list_collections()
+            if collection_name in existing_collections:
+                chromadb_service.delete_collection(collection_name)
+        except Exception as cleanup_error:
+            print(f"[SchemaProcess] Unable to clear existing collection '{collection_name}': {cleanup_error}")
+
         chunks = _create_enriched_schema_chunks(schema_data, schema_text)
-        
         if not chunks:
             raise HTTPException(status_code=400, detail="No schema content to vectorize")
-        
-        # Generate embeddings
-        all_texts = [chunk['text'] for chunk in chunks]
+
+        all_texts = [chunk["text"] for chunk in chunks]
         embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
-        
-        # Prepare metadata and IDs
+
         all_metadatas = []
         all_ids = []
-        for i, chunk in enumerate(chunks):
-            metadata = chunk['metadata'].copy()
-            metadata['session_id'] = str(session.id)
-            metadata['connection_id'] = str(connection_id)
-            metadata['chunk_index'] = i
+        for idx, chunk in enumerate(chunks):
+            metadata = dict(chunk.get("metadata") or {})
+            metadata["session_id"] = str(session.id)
+            metadata["connection_id"] = str(connection_id)
+            metadata["chunk_index"] = idx
             all_metadatas.append(metadata)
-            all_ids.append(f"schema_{connection_id}_{chunk['metadata'].get('chunk_type', 'text')}_{i}")
-        
-        # Add to ChromaDB
+            all_ids.append(f"schema_{connection_id}_{session.id}_{idx}")
+
         chromadb_service.add_documents(
             collection_name=collection_name,
             texts=all_texts,
@@ -1622,15 +1802,13 @@ async def process_database_schema(
             metadatas=all_metadatas,
             ids=all_ids
         )
-        
-        # Update schema to mark as processed
-        schema.is_processed = 1
-        schema.session_id = session.id
+
+        session_schema.is_processed = 1
+        session_schema.updated_at = datetime.utcnow()
         db.commit()
-        
-        # Build preview
+
         preview_text = schema_text[:2000] if schema_text else "Schema processed successfully"
-        
+
         return {
             "success": True,
             "session_id": session.id,
@@ -1638,6 +1816,15 @@ async def process_database_schema(
             "total_chunks": len(chunks),
             "message": "Schema processed and vectorized successfully",
             "used_embedding_model": embedding_model_name,
+            "session_created": session_created,
+            "session": {
+                "id": session.id,
+                "name": session.session_name,
+                "created_at": session.created_at.isoformat(),
+                "connection_id": connection_id,
+                "hasVectorizedData": True,
+                "session_type": "database"
+            },
             "preview": {
                 "summary": preview_text
             }
@@ -1653,7 +1840,7 @@ async def create_database_session(
     session_data: dict,
     db: Session = Depends(get_db)
 ):
-    """Create a new clean chat session for an existing processed database schema."""
+    """Create a brand new chat session for a database connection (no vectors yet)."""
     try:
         connection_id = session_data.get("connection_id")
         if not connection_id:
@@ -1663,33 +1850,33 @@ async def create_database_session(
         if not connection:
             raise HTTPException(status_code=404, detail="Database connection not found")
 
-        # Find the most recently processed schema for this connection
-        schema_record = (
+        # Locate base schema (session_id is NULL)
+        base_schema = (
             db.query(DatabaseSchema)
             .filter(
                 DatabaseSchema.connection_id == connection_id,
-                DatabaseSchema.is_processed == 1
+                DatabaseSchema.session_id.is_(None)
             )
-            .order_by(DatabaseSchema.updated_at.desc())
+            .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
             .first()
         )
 
-        if not schema_record or not schema_record.schema_data:
+        if not base_schema:
+            base_schema = (
+                db.query(DatabaseSchema)
+                .filter(DatabaseSchema.connection_id == connection_id)
+                .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
+                .first()
+            )
+
+        if not base_schema or not base_schema.schema_data:
             raise HTTPException(
                 status_code=400,
-                detail="Process the schema for this connection before creating a chat session."
+                detail="Extract the schema for this connection before creating a chat session."
             )
 
         user_id = session_data.get("user_id", connection.user_id if hasattr(connection, "user_id") else 1)
-        requested_llm_model_id = session_data.get("llm_model_id")
-
-        existing_session = None
-        if schema_record.session_id:
-            existing_session = db.query(ChatSession).filter(ChatSession.id == schema_record.session_id).first()
-
-        llm_model_id = requested_llm_model_id
-        if not llm_model_id and existing_session:
-            llm_model_id = existing_session.llm_model_id
+        llm_model_id = session_data.get("llm_model_id")
 
         if not llm_model_id:
             default_llm = (
@@ -1701,19 +1888,6 @@ async def create_database_session(
             if not default_llm:
                 raise HTTPException(status_code=400, detail="No LLM models are configured. Add an LLM model first.")
             llm_model_id = default_llm.id
-
-        embedding_model_name = session_data.get("embedding_model_name")
-        if embedding_model_name and not get_embedding_model_info(embedding_model_name):
-            embedding_model_name = None
-        if not embedding_model_name:
-            embedding_model_name = get_default_embedding_model()
-
-        embedding_model_info = get_embedding_model_info(embedding_model_name)
-        if not embedding_model_info:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Embedding model '{embedding_model_name}' is not available. Configure embedding models first."
-            )
 
         session_name = session_data.get(
             "session_name",
@@ -1731,84 +1905,30 @@ async def create_database_session(
         db.commit()
         db.refresh(new_session)
 
-        collection_name = f"db_session_{new_session.id}"
-
-        try:
-            schema_data_copy = copy.deepcopy(schema_record.schema_data)
-            schema_text = schema_record.schema_text or ""
-
-            chunks = _create_enriched_schema_chunks(schema_data_copy, schema_text)
-            if not chunks:
-                raise ValueError("No schema content available to vectorize.")
-
-            all_texts = []
-            all_metadatas = []
-            all_ids = []
-
-            for idx, chunk in enumerate(chunks):
-                text = chunk.get("text")
-                if not text:
-                    continue
-                metadata = dict(chunk.get("metadata") or {})
-                metadata["session_id"] = str(new_session.id)
-                metadata["connection_id"] = str(connection_id)
-                metadata["chunk_index"] = idx
-                if not metadata:
-                    metadata = {
-                        "session_id": str(new_session.id),
-                        "connection_id": str(connection_id),
-                        "chunk_index": idx
-                    }
-                all_texts.append(text)
-                all_metadatas.append(metadata)
-                all_ids.append(f"schema_{connection_id}_{new_session.id}_{idx}")
-
-            if not all_texts:
-                raise ValueError("Schema contains no vectorizable text.")
-
-            embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
-            chromadb_service.add_documents(
-                collection_name=collection_name,
-                texts=all_texts,
-                embeddings=embeddings,
-                metadatas=all_metadatas,
-                ids=all_ids
-            )
-
-            new_schema = DatabaseSchema(
-                connection_id=connection_id,
-                session_id=new_session.id,
-                schema_data=schema_data_copy,
-                schema_text=schema_text,
-                is_processed=1,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
-            )
-            db.add(new_schema)
-            db.commit()
-
-        except Exception as vec_error:
-            db.delete(new_session)
-            db.commit()
-            try:
-                chromadb_service.delete_collection(collection_name)
-            except Exception:
-                pass
-            raise HTTPException(status_code=500, detail=f"Failed to prepare session vectors: {str(vec_error)}")
+        # Create a schema record bound to this session (marked as not processed)
+        session_schema = DatabaseSchema(
+            connection_id=connection_id,
+            session_id=new_session.id,
+            schema_data=copy.deepcopy(base_schema.schema_data or {}),
+            schema_text=base_schema.schema_text or "",
+            is_processed=0,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.add(session_schema)
+        db.commit()
 
         return {
             "success": True,
-            "message": "New database chat session created.",
+            "message": "New database chat session created. Process the schema before chatting.",
             "session": {
                 "id": new_session.id,
                 "name": new_session.session_name,
                 "created_at": new_session.created_at.isoformat(),
                 "connection_id": connection_id,
-                "hasVectorizedData": True,
+                "hasVectorizedData": False,
                 "session_type": "database"
-            },
-            "collection_name": collection_name,
-            "embedding_model_name": embedding_model_name
+            }
         }
     except HTTPException:
         raise
@@ -1848,16 +1968,66 @@ async def database_chat(
         }
         
         # Get database connection and schema
-        schema = db.query(DatabaseSchema).filter(DatabaseSchema.session_id == session_id).first()
+        schema = (
+            db.query(DatabaseSchema)
+            .filter(
+                DatabaseSchema.connection_id == connection_id,
+                DatabaseSchema.session_id.is_(None)
+            )
+            .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
+            .first()
+        )
         if not schema:
-            raise HTTPException(status_code=404, detail="Schema not found for this session")
+            schema = (
+                db.query(DatabaseSchema)
+                .filter(DatabaseSchema.connection_id == connection_id)
+                .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
+                .first()
+            )
+        
+        if not schema:
+            raise HTTPException(status_code=404, detail="Schema not found")
+        
+        if not schema.is_processed:
+            raise HTTPException(
+                status_code=400,
+                detail="This session has not been processed yet. Process & vectorize the schema before chatting."
+            )
         
         connection = db.query(DatabaseConnection).filter(
             DatabaseConnection.id == schema.connection_id
         ).first()
         if not connection:
             raise HTTPException(status_code=404, detail="Database connection not found")
+        connection_id = connection.id
         
+        # Ensure the session has a vector store; rebuild if needed
+        collection_name = f"db_session_{session_id}"
+        try:
+            existing_collections = chromadb_service.list_collections()
+        except Exception:
+            existing_collections = []
+
+        if schema.is_processed and collection_name not in existing_collections:
+            try:
+                rebuilt = _vectorize_schema_for_session(
+                    db,
+                    session,
+                    schema,
+                    connection,
+                    embedding_model_name=None
+                )
+                if rebuilt:
+                    existing_collections = chromadb_service.list_collections()
+            except Exception as rebuild_error:
+                print(f"[Chat] Failed to rebuild vectors for session {session_id}: {rebuild_error}")
+
+        if collection_name not in existing_collections:
+            raise HTTPException(
+                status_code=400,
+                detail="This session has not been processed yet. Process the schema before chatting."
+            )
+
         # Create agent system with model config and services for semantic search
         agent_llm_service = LLMService()
         # Create agent system with model config and embedding/chromadb services
@@ -1873,9 +2043,6 @@ async def database_chat(
         previous_messages = db.query(ChatMessageModel).filter(
             ChatMessageModel.session_id == session_id
         ).order_by(ChatMessageModel.created_at).limit(10).all()
-        
-        # Collection name for semantic search
-        collection_name = f"db_session_{session_id}"
         
         # Get embedding model name (use default if not specified)
         embedding_model_name = get_default_embedding_model()
