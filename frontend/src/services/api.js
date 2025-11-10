@@ -258,6 +258,18 @@ export const databaseChatAPI = {
     return response.data;
   },
 
+  createSession: async ({ connectionId, sessionName, userId = 1, llmModelId, embeddingModelName }) => {
+    const payload = {
+      connection_id: connectionId,
+      session_name: sessionName,
+      user_id: userId,
+      llm_model_id: llmModelId,
+      embedding_model_name: embeddingModelName,
+    };
+    const response = await api.post('/api/database/sessions', payload);
+    return response.data;
+  },
+
   uploadKnowledge: async ({ connectionId, sessionId, title, description, file }) => {
     const formData = new FormData();
     if (connectionId !== undefined && connectionId !== null) {

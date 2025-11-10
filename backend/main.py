@@ -9,6 +9,7 @@ import json
 import aiofiles
 import os
 import uuid
+import copy
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import get_db
@@ -1645,6 +1646,174 @@ async def process_database_schema(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process schema: {str(e)}")
+
+
+@app.post("/api/database/sessions")
+async def create_database_session(
+    session_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Create a new clean chat session for an existing processed database schema."""
+    try:
+        connection_id = session_data.get("connection_id")
+        if not connection_id:
+            raise HTTPException(status_code=400, detail="connection_id is required")
+
+        connection = db.query(DatabaseConnection).filter(DatabaseConnection.id == connection_id).first()
+        if not connection:
+            raise HTTPException(status_code=404, detail="Database connection not found")
+
+        # Find the most recently processed schema for this connection
+        schema_record = (
+            db.query(DatabaseSchema)
+            .filter(
+                DatabaseSchema.connection_id == connection_id,
+                DatabaseSchema.is_processed == 1
+            )
+            .order_by(DatabaseSchema.updated_at.desc())
+            .first()
+        )
+
+        if not schema_record or not schema_record.schema_data:
+            raise HTTPException(
+                status_code=400,
+                detail="Process the schema for this connection before creating a chat session."
+            )
+
+        user_id = session_data.get("user_id", connection.user_id if hasattr(connection, "user_id") else 1)
+        requested_llm_model_id = session_data.get("llm_model_id")
+
+        existing_session = None
+        if schema_record.session_id:
+            existing_session = db.query(ChatSession).filter(ChatSession.id == schema_record.session_id).first()
+
+        llm_model_id = requested_llm_model_id
+        if not llm_model_id and existing_session:
+            llm_model_id = existing_session.llm_model_id
+
+        if not llm_model_id:
+            default_llm = (
+                db.query(LLMModel)
+                .filter(LLMModel.is_active == 1)
+                .order_by(LLMModel.id)
+                .first()
+            ) or db.query(LLMModel).order_by(LLMModel.id).first()
+            if not default_llm:
+                raise HTTPException(status_code=400, detail="No LLM models are configured. Add an LLM model first.")
+            llm_model_id = default_llm.id
+
+        embedding_model_name = session_data.get("embedding_model_name")
+        if embedding_model_name and not get_embedding_model_info(embedding_model_name):
+            embedding_model_name = None
+        if not embedding_model_name:
+            embedding_model_name = get_default_embedding_model()
+
+        embedding_model_info = get_embedding_model_info(embedding_model_name)
+        if not embedding_model_info:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Embedding model '{embedding_model_name}' is not available. Configure embedding models first."
+            )
+
+        session_name = session_data.get(
+            "session_name",
+            f"{connection.name} Session {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        new_session = ChatSession(
+            user_id=user_id,
+            session_name=session_name,
+            llm_model_id=llm_model_id,
+            embedding_model_id=None,
+            created_at=datetime.utcnow()
+        )
+        db.add(new_session)
+        db.commit()
+        db.refresh(new_session)
+
+        collection_name = f"db_session_{new_session.id}"
+
+        try:
+            schema_data_copy = copy.deepcopy(schema_record.schema_data)
+            schema_text = schema_record.schema_text or ""
+
+            chunks = _create_enriched_schema_chunks(schema_data_copy, schema_text)
+            if not chunks:
+                raise ValueError("No schema content available to vectorize.")
+
+            all_texts = []
+            all_metadatas = []
+            all_ids = []
+
+            for idx, chunk in enumerate(chunks):
+                text = chunk.get("text")
+                if not text:
+                    continue
+                metadata = dict(chunk.get("metadata") or {})
+                metadata["session_id"] = str(new_session.id)
+                metadata["connection_id"] = str(connection_id)
+                metadata["chunk_index"] = idx
+                if not metadata:
+                    metadata = {
+                        "session_id": str(new_session.id),
+                        "connection_id": str(connection_id),
+                        "chunk_index": idx
+                    }
+                all_texts.append(text)
+                all_metadatas.append(metadata)
+                all_ids.append(f"schema_{connection_id}_{new_session.id}_{idx}")
+
+            if not all_texts:
+                raise ValueError("Schema contains no vectorizable text.")
+
+            embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+            chromadb_service.add_documents(
+                collection_name=collection_name,
+                texts=all_texts,
+                embeddings=embeddings,
+                metadatas=all_metadatas,
+                ids=all_ids
+            )
+
+            new_schema = DatabaseSchema(
+                connection_id=connection_id,
+                session_id=new_session.id,
+                schema_data=schema_data_copy,
+                schema_text=schema_text,
+                is_processed=1,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.add(new_schema)
+            db.commit()
+
+        except Exception as vec_error:
+            db.delete(new_session)
+            db.commit()
+            try:
+                chromadb_service.delete_collection(collection_name)
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"Failed to prepare session vectors: {str(vec_error)}")
+
+        return {
+            "success": True,
+            "message": "New database chat session created.",
+            "session": {
+                "id": new_session.id,
+                "name": new_session.session_name,
+                "created_at": new_session.created_at.isoformat(),
+                "connection_id": connection_id,
+                "hasVectorizedData": True,
+                "session_type": "database"
+            },
+            "collection_name": collection_name,
+            "embedding_model_name": embedding_model_name
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create database session: {str(e)}")
 
 @app.post("/api/database/chat")
 async def database_chat(

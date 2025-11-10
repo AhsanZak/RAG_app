@@ -80,6 +80,7 @@ const DatabaseChat = ({ onBack }) => {
   const [knowledgeFileList, setKnowledgeFileList] = useState([]);
   const [knowledgeUploading, setKnowledgeUploading] = useState(false);
   const [isProcessingMessage, setIsProcessingMessage] = useState(false);
+  const [creatingSession, setCreatingSession] = useState(false);
   const [activeTab, setActiveTab] = useState('chat');
   const { Dragger } = Upload;
 
@@ -579,6 +580,70 @@ const DatabaseChat = ({ onBack }) => {
       console.error('Error loading sessions:', error);
       setSessions([]);
       setCurrentSession(null);
+    }
+  };
+
+  const handleCreateNewSession = async () => {
+    if (!currentConnection) {
+      message.warning('Select a connection first');
+      return;
+    }
+    if (!schemaData || !schemaData.schema_data) {
+      message.warning('Extract and process the schema before creating a new session');
+      return;
+    }
+    if (!selectedModel) {
+      message.warning('Select an LLM model first');
+      return;
+    }
+
+    setCreatingSession(true);
+    setChatMessages([]);
+    setSessionReady(false);
+
+    try {
+      const timestampLabel = new Date().toLocaleString();
+      const sessionName = `${currentConnection.name} - Session ${timestampLabel}`;
+
+      const result = await databaseChatAPI.createSession({
+        connectionId: currentConnection.id,
+        sessionName,
+        userId: 1,
+        llmModelId: selectedModel,
+        embeddingModelName: selectedEmbeddingModelName || 'all-MiniLM-L6-v2',
+      });
+
+      message.success('New session created');
+
+      const sessionsData = await databaseChatAPI.getSessions(1, currentConnection.id);
+      const dbSessions = sessionsData.filter(s => s.session_type === 'database');
+      setSessions(dbSessions);
+
+      await loadKnowledge(currentConnection.id);
+
+      const newSessionId = result.session?.id || result.session_id;
+      let sessionToSelect = dbSessions.find(s => s.id === newSessionId);
+
+      if (!sessionToSelect && dbSessions.length > 0) {
+        sessionToSelect = dbSessions
+          .slice()
+          .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+      }
+
+      if (sessionToSelect) {
+        setCurrentSession(sessionToSelect);
+        setChatMessages([]);
+        await handleSelectSession(sessionToSelect);
+      } else {
+        setCurrentSession(null);
+        setChatMessages([]);
+        setSessionReady(false);
+      }
+    } catch (error) {
+      console.error('Failed to create new session:', error);
+      message.error(error.response?.data?.detail || 'Failed to create new session');
+    } finally {
+      setCreatingSession(false);
     }
   };
 
@@ -1616,37 +1681,57 @@ const DatabaseChat = ({ onBack }) => {
             )}
 
             {/* Sessions List - similar to PDF Chat */}
-            {currentConnection && sessions.length > 0 && (
+            {currentConnection && (
               <Card
                 className="sidebar-sessions"
                 size="small"
                 title="Chat Sessions"
                 style={{ marginTop: 12 }}
+                extra={
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<PlusOutlined />}
+                    onClick={handleCreateNewSession}
+                    loading={creatingSession}
+                  >
+                    New
+                  </Button>
+                }
               >
-                <List
-                  size="small"
-                  dataSource={sessions}
-                  renderItem={(session) => (
-                    <List.Item
-                      className={`session-item ${currentSession?.id === session.id ? 'active' : ''}`}
-                      onClick={() => handleSelectSession(session)}
-                    >
-                      <List.Item.Meta
-                        avatar={<DatabaseOutlined />}
-                        title={<span style={{ fontSize: 13 }}>{session.name}</span>}
-                        description={
-                          <span style={{ fontSize: 12 }}>
-                            {session.message_count || 0} messages
-                            {session.hasVectorizedData ? ' - Ready' : ' - Processing'}
-                          </span>
-                        }
-                      />
-                      {session.hasVectorizedData && (
-                        <Tag color="green" style={{ marginInlineStart: 6 }}>Ready</Tag>
-                      )}
-                    </List.Item>
-                  )}
-                />
+                {sessions.length === 0 ? (
+                  <Alert
+                    message="No chat sessions"
+                    description="Use the New button to start a fresh conversation for this database."
+                    type="info"
+                    showIcon
+                  />
+                ) : (
+                  <List
+                    size="small"
+                    dataSource={sessions}
+                    renderItem={(session) => (
+                      <List.Item
+                        className={`session-item ${currentSession?.id === session.id ? 'active' : ''}`}
+                        onClick={() => handleSelectSession(session)}
+                      >
+                        <List.Item.Meta
+                          avatar={<DatabaseOutlined />}
+                          title={<span style={{ fontSize: 13 }}>{session.name}</span>}
+                          description={
+                            <span style={{ fontSize: 12 }}>
+                              {session.message_count || 0} messages
+                              {session.hasVectorizedData ? ' - Ready' : ' - Processing'}
+                            </span>
+                          }
+                        />
+                        {session.hasVectorizedData && (
+                          <Tag color="green" style={{ marginInlineStart: 6 }}>Ready</Tag>
+                        )}
+                      </List.Item>
+                    )}
+                  />
+                )}
               </Card>
             )}
           </div>
