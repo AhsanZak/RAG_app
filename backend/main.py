@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import uvicorn
@@ -7,11 +8,34 @@ import requests
 import json
 import aiofiles
 import os
+import uuid
+import copy
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider, EmbeddingModel, DatabaseConnection, DatabaseSchema
+from models import User, LLMModel, ChatSession, ChatMessage as ChatMessageModel, LLMProvider, EmbeddingModel, DatabaseConnection, DatabaseSchema, DatabaseKnowledge
 from config.embedding_models import AVAILABLE_EMBEDDINGS, get_default_embedding_model, get_embedding_model_info, list_embedding_models
+
+KNOWLEDGE_UPLOAD_DIR = os.path.join(os.getcwd(), "uploads", "database_knowledge")
+os.makedirs(KNOWLEDGE_UPLOAD_DIR, exist_ok=True)
+
+
+def _serialize_knowledge_item(item: DatabaseKnowledge) -> Dict[str, Any]:
+    return {
+        "id": item.id,
+        "connection_id": item.connection_id,
+        "session_id": item.session_id,
+        "user_id": item.user_id,
+        "title": item.title,
+        "description": item.description,
+        "original_filename": item.original_filename,
+        "file_type": item.file_type,
+        "content_type": item.content_type,
+        "file_url": f"/api/database/knowledge/{item.id}/download",
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+        "created_at_human": item.created_at.strftime("%Y-%m-%d %H:%M:%S") if item.created_at else None,
+        "tags": item.tags or [],
+    }
 
 def _create_enriched_schema_chunks(schema_data: dict, schema_text: str) -> List[dict]:
     """
@@ -196,6 +220,211 @@ Relationship Type: Foreign Key Constraint
             })
     
     return chunks
+
+
+def _build_condensed_chat_summary(
+    chroma_service: "ChromaDBService",
+    embed_service: "EmbeddingService",
+    collection_name: str,
+    user_query: str,
+    embedding_model_name: str,
+    fallback_messages: Optional[List["ChatMessageModel"]] = None,
+    max_items: int = 5,
+    max_chars: int = 1200
+) -> Optional[str]:
+    """
+    Build a condensed conversational summary using vectorized chat history.
+    Falls back to latest raw messages if vector retrieval fails.
+    """
+    summary_lines: List[str] = []
+
+    try:
+        query_embedding = embed_service.generate_embeddings(
+            [user_query],
+            model_name=embedding_model_name
+        )
+        if query_embedding.ndim == 1:
+            query_embedding = query_embedding.reshape(1, -1)
+
+        results = chroma_service.query_collection(
+            collection_name=collection_name,
+            query_embeddings=query_embedding,
+            n_results=max_items,
+            include=["documents", "metadatas", "distances"]
+        )
+
+        documents = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
+        if documents and len(documents) > 0:
+            doc_list = documents[0]
+            meta_list = metadatas[0] if metadatas else [{}] * len(doc_list)
+
+            for doc, meta in zip(doc_list[:max_items], meta_list[:max_items]):
+                if not isinstance(doc, str):
+                    continue
+
+                role = "Message"
+                if isinstance(meta, dict):
+                    role = meta.get("role", role)
+
+                text = doc.strip()
+                if ":" in text:
+                    prefix, remainder = text.split(":", 1)
+                    if not isinstance(meta, dict) or not meta.get("role"):
+                        role = prefix.strip()
+                    text = remainder.strip()
+
+                text = " ".join(text.split())
+                if len(text) > 200:
+                    text = text[:197] + "..."
+
+                summary_lines.append(f"{role.title()}: {text}")
+
+    except Exception as e:
+        print(f"[Chat] Unable to build vectorized conversation summary: {str(e)}")
+
+    if not summary_lines and fallback_messages:
+        recent = fallback_messages[-max_items:]
+        for msg in recent:
+            role = getattr(msg, "role", "message").title()
+            text = getattr(msg, "message", "")
+            text = " ".join((text or "").split())
+            if len(text) > 200:
+                text = text[:197] + "..."
+            summary_lines.append(f"{role}: {text}")
+
+    if not summary_lines:
+        return None
+
+    summary_text = "Relevant conversation context:\n" + "\n".join(f"- {line}" for line in summary_lines)
+    if len(summary_text) > max_chars:
+        summary_text = summary_text[: max_chars - 3] + "..."
+    return summary_text
+
+def _vectorize_schema_for_session(
+    db_session: Session,
+    session: ChatSession,
+    schema_record: DatabaseSchema,
+    connection: DatabaseConnection,
+    embedding_model_name: Optional[str] = None
+) -> bool:
+    """Ensure a session has an up-to-date vector store for its schema."""
+    if not schema_record or not schema_record.schema_data:
+        return False
+
+    schema_data = copy.deepcopy(schema_record.schema_data or {})
+    schema_text = schema_record.schema_text or ""
+
+    if embedding_model_name and not get_embedding_model_info(embedding_model_name):
+        embedding_model_name = None
+    if not embedding_model_name:
+        # Try to read embedding model from schema metadata, fall back to default
+        meta_block = None
+        if isinstance(schema_data, dict):
+            meta_block = schema_data.get("_meta") or schema_data.get("meta")
+        if isinstance(meta_block, dict):
+            embedding_model_name = meta_block.get("embedding_model")
+    if embedding_model_name and not get_embedding_model_info(embedding_model_name):
+        embedding_model_name = None
+    if not embedding_model_name:
+        embedding_model_name = get_default_embedding_model()
+
+    collection_name = f"db_session_{session.id}"
+    try:
+        existing_collections = chromadb_service.list_collections()
+    except Exception:
+        existing_collections = []
+
+    try:
+        if collection_name in existing_collections:
+            chromadb_service.delete_collection(collection_name)
+    except Exception as cleanup_error:
+        print(f"[SchemaVectors] Unable to clear existing collection '{collection_name}': {cleanup_error}")
+
+    chunks = _create_enriched_schema_chunks(schema_data, schema_text)
+    if not chunks:
+        return False
+
+    all_texts = [chunk.get("text") for chunk in chunks if chunk.get("text")]
+    if not all_texts:
+        return False
+
+    embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+
+    all_metadatas = []
+    all_ids = []
+    for idx, chunk in enumerate(chunks):
+        text = chunk.get("text")
+        if not text:
+            continue
+        metadata = dict(chunk.get("metadata") or {})
+        metadata["session_id"] = str(session.id)
+        metadata["connection_id"] = str(connection.id)
+        metadata["chunk_index"] = idx
+        all_metadatas.append(metadata)
+        all_ids.append(f"schema_{connection.id}_{session.id}_{idx}")
+
+    chromadb_service.add_documents(
+        collection_name=collection_name,
+        texts=all_texts,
+        embeddings=embeddings,
+        metadatas=all_metadatas,
+        ids=all_ids
+    )
+
+    # Update schema metadata and flags
+    if isinstance(schema_data, dict):
+        meta_block = schema_data.setdefault("_meta", {})
+        if isinstance(meta_block, dict):
+            meta_block["embedding_model"] = embedding_model_name
+            meta_block["vectorized_at"] = datetime.utcnow().isoformat()
+        schema_record.schema_data = schema_data
+
+    schema_record.is_processed = 1
+    schema_record.session_id = session.id
+    schema_record.updated_at = datetime.utcnow()
+    db_session.commit()
+
+    return True
+
+def _generate_result_analysis(
+    llm_service: "LLMService",
+    user_query: str,
+    executed_sql: str,
+    result_rows: List[Dict[str, Any]],
+    model_config: Dict[str, Any],
+    max_rows: int = 8
+) -> Optional[str]:
+    """Ask the LLM to analyze query results and produce a narrative summary."""
+    if not result_rows:
+        return None
+
+    try:
+        sample_rows = result_rows[:max_rows]
+        rows_text = json.dumps(sample_rows, indent=2, default=str)
+
+        prompt = (
+            "You are a senior data analyst. Review the SQL query, the user's request, and the returned data.\n"
+            "Provide a concise natural-language explanation that links the findings back to the user's intent.\n"
+            "Highlight notable patterns, relationships (e.g., rental counts, actor popularity), or factors that explain the results.\n"
+            "If the data alone is insufficient to fully answer the user's question, mention what evidence is available and what is missing.\n"
+            "Do not invent facts beyond the dataset.\n\n"
+            f"User Query:\n{user_query}\n\n"
+            f"Executed SQL:\n{executed_sql}\n\n"
+            f"Result Sample (JSON):\n{rows_text}\n\n"
+            "Respond with one or two paragraphs summarizing the key insights, using field names from the data when relevant."
+        )
+
+        analysis = llm_service.generate_response(
+            messages=[{"role": "user", "content": prompt}],
+            model_config=model_config,
+            temperature=0.5
+        )
+        return analysis.strip()
+    except Exception as analysis_error:
+        print(f"[ResultAnalysis] Unable to generate analysis: {analysis_error}")
+        return None
+
 from services.pdf_processor import PDFProcessor
 from services.embedding_service import EmbeddingService
 from services.chromadb_service import ChromaDBService
@@ -1078,20 +1307,37 @@ async def get_sessions(
         schema = db.query(DatabaseSchema).filter(DatabaseSchema.session_id == s.id).first()
         
         if schema:
-            # Database session - use db_session_ prefix
             collection_name = f"db_session_{s.id}"
             session_type = "database"
+            has_vectorized_data = collection_name in existing_collections
+
+            if schema.is_processed and not has_vectorized_data:
+                connection = db.query(DatabaseConnection).filter(DatabaseConnection.id == schema.connection_id).first()
+                if connection:
+                    try:
+                        rebuilt = _vectorize_schema_for_session(
+                            db,
+                            s,
+                            schema,
+                            connection,
+                            embedding_model_name=None
+                        )
+                        if rebuilt:
+                            existing_collections = chromadb_service.list_collections()
+                            has_vectorized_data = collection_name in existing_collections
+                    except Exception as ensure_err:
+                        print(f"[SESSIONS] Failed to rebuild vectors for session {s.id}: {ensure_err}")
         else:
             # PDF/Excel sessions use session_ prefix
             collection_name = f"session_{s.id}"
             session_type = "pdf"
-            
+
             # Try to determine if this session belongs to Excel chat based on metadata
             if collection_name in existing_collections:
                 try:
                     sample = chromadb_service.peek_collection(collection_name, n_results=3)
                     metadata_entries = sample.get("metadatas") or []
-                    
+
                     # Flatten metadata lists and keep dicts only
                     flattened_metadata = []
                     for item in metadata_entries:
@@ -1099,7 +1345,7 @@ async def get_sessions(
                             flattened_metadata.append(item)
                         elif isinstance(item, list):
                             flattened_metadata.extend([meta for meta in item if isinstance(meta, dict)])
-                    
+
                     def is_excel_metadata(meta: Dict) -> bool:
                         filename = meta.get("filename", "")
                         sheet_name = meta.get("sheet_name")
@@ -1109,14 +1355,14 @@ async def get_sessions(
                             or bool(sheet_name)
                             or (isinstance(filename, str) and filename.lower().endswith((".xlsx", ".xls", ".xlsm")))
                         )
-                    
+
                     if any(is_excel_metadata(meta) for meta in flattened_metadata):
                         session_type = "excel"
                 except Exception as e:
                     print(f"[SESSIONS] Could not inspect collection '{collection_name}' metadata: {e}")
-        
-        has_vectorized_data = collection_name in existing_collections
-        
+
+            has_vectorized_data = collection_name in existing_collections
+
         result.append({
             "id": s.id,
             "name": s.session_name,
@@ -1448,78 +1694,163 @@ async def process_database_schema(
     session_data: dict,
     db: Session = Depends(get_db)
 ):
-    """Process schema and create ChromaDB collection"""
+    """Process a database schema for a specific session and build its vector store."""
     try:
         connection_id = session_data.get("connection_id")
         user_id = session_data.get("user_id", 1)
-        session_name = session_data.get("session_name", "New Session")
-        
+        target_session_id = session_data.get("session_id")
+        requested_llm_model_id = session_data.get("llm_model_id")
+
         if not connection_id:
             raise HTTPException(status_code=400, detail="connection_id is required")
-        
-        # Get schema from database
-        schema = db.query(DatabaseSchema).filter(
-            DatabaseSchema.connection_id == connection_id
-        ).first()
-        
-        if not schema:
-            raise HTTPException(status_code=404, detail="Schema not found. Please extract schema first.")
-        
-        # Create or get session
-        embedding_model_name = session_data.get("embedding_model_name")
-        if not embedding_model_name:
-            # Use a better default for database schema - prefer BGE models for NL-to-SQL accuracy
-            default_models = ["BAAI/bge-large-en-v1.5", "BAAI/bge-base-en", "sentence-transformers/all-mpnet-base-v2"]
-            embedding_model_name = get_default_embedding_model()
-            # Try to use a better model if available, otherwise fall back to default
-            try:
-                # Check if BGE models are available in the embedding models list
-                model_info = get_embedding_model_info("BAAI/bge-base-en")
-                if model_info:
-                    embedding_model_name = "BAAI/bge-base-en"  # Use BGE base as it's good balance
-            except:
-                pass  # Use default if better model not available
-        
-        session = ChatSession(
-            user_id=user_id,
-            session_name=session_name,
-            llm_model_id=session_data.get("llm_model_id", 1),
-            embedding_model_id=None,
-            created_at=datetime.utcnow()
+
+        # Determine the base schema (session_id is NULL)
+        base_schema = (
+            db.query(DatabaseSchema)
+            .filter(
+                DatabaseSchema.connection_id == connection_id,
+                DatabaseSchema.session_id.is_(None)
+            )
+            .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
+            .first()
         )
-        db.add(session)
+
+        if not base_schema:
+            # Fallback for legacy data – use the most recent schema regardless of session binding
+            base_schema = (
+                db.query(DatabaseSchema)
+                .filter(DatabaseSchema.connection_id == connection_id)
+                .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
+                .first()
+            )
+
+        if not base_schema or not base_schema.schema_data:
+            raise HTTPException(
+                status_code=404,
+                detail="Schema not found. Please extract and save the schema before processing."
+            )
+
+        schema_data = copy.deepcopy(base_schema.schema_data or {})
+        schema_text = base_schema.schema_text or ""
+
+        # Resolve embedding model to use
+        embedding_model_name = session_data.get("embedding_model_name")
+        if embedding_model_name and not get_embedding_model_info(embedding_model_name):
+            embedding_model_name = None
+        if not embedding_model_name:
+            session_schema_meta = None
+            if isinstance(base_schema.schema_data, dict):
+                session_schema_meta = base_schema.schema_data.get("_meta")
+            if isinstance(session_schema_meta, dict):
+                stored_model = session_schema_meta.get("embedding_model")
+                if stored_model and get_embedding_model_info(stored_model):
+                    embedding_model_name = stored_model
+            if not embedding_model_name:
+                embedding_model_name = get_default_embedding_model()
+
+        # Resolve LLM model ID
+        llm_model_id = requested_llm_model_id
+        session: Optional[ChatSession] = None
+        session_created = False
+
+        if target_session_id:
+            session = db.query(ChatSession).filter(ChatSession.id == target_session_id).first()
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if not llm_model_id:
+                llm_model_id = session.llm_model_id
+        else:
+            session_name = session_data.get(
+                "session_name",
+                f"Database Session {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            session = ChatSession(
+                user_id=user_id,
+                session_name=session_name,
+                llm_model_id=session_data.get("llm_model_id", 1),
+                embedding_model_id=None,
+                created_at=datetime.utcnow()
+            )
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+            session_created = True
+            if not llm_model_id:
+                llm_model_id = session.llm_model_id
+
+        if not llm_model_id:
+            default_llm = (
+                db.query(LLMModel)
+                .filter(LLMModel.is_active == 1)
+                .order_by(LLMModel.id)
+                .first()
+            ) or db.query(LLMModel).order_by(LLMModel.id).first()
+            if not default_llm:
+                raise HTTPException(status_code=400, detail="No LLM models are configured. Add an LLM model first.")
+            llm_model_id = default_llm.id
+            if session_created:
+                session.llm_model_id = llm_model_id
+                db.commit()
+
+        if session.llm_model_id != llm_model_id:
+            session.llm_model_id = llm_model_id
+            db.commit()
+
+        # Ensure there is a schema record bound to this session
+        session_schema = (
+            db.query(DatabaseSchema)
+            .filter(
+                DatabaseSchema.connection_id == connection_id,
+                DatabaseSchema.session_id == session.id
+            )
+            .first()
+        )
+
+        if not session_schema:
+            session_schema = DatabaseSchema(
+                connection_id=connection_id,
+                session_id=session.id,
+                schema_data=schema_data,
+                schema_text=schema_text,
+                is_processed=0,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.add(session_schema)
+        else:
+            session_schema.schema_data = schema_data
+            session_schema.schema_text = schema_text
+            session_schema.is_processed = 0
+            session_schema.updated_at = datetime.utcnow()
         db.commit()
-        db.refresh(session)
-        
-        # Collection name based on session ID
+
         collection_name = f"db_session_{session.id}"
-        
-        # Prepare schema data and text
-        schema_data = schema.schema_data or {}
-        schema_text = schema.schema_text or ""
-        
-        # Create enriched schema chunks with synonyms and better descriptions
+
+        # Clear existing vectors for this session (if any)
+        try:
+            existing_collections = chromadb_service.list_collections()
+            if collection_name in existing_collections:
+                chromadb_service.delete_collection(collection_name)
+        except Exception as cleanup_error:
+            print(f"[SchemaProcess] Unable to clear existing collection '{collection_name}': {cleanup_error}")
+
         chunks = _create_enriched_schema_chunks(schema_data, schema_text)
-        
         if not chunks:
             raise HTTPException(status_code=400, detail="No schema content to vectorize")
-        
-        # Generate embeddings
-        all_texts = [chunk['text'] for chunk in chunks]
+
+        all_texts = [chunk["text"] for chunk in chunks]
         embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
-        
-        # Prepare metadata and IDs
+
         all_metadatas = []
         all_ids = []
-        for i, chunk in enumerate(chunks):
-            metadata = chunk['metadata'].copy()
-            metadata['session_id'] = str(session.id)
-            metadata['connection_id'] = str(connection_id)
-            metadata['chunk_index'] = i
+        for idx, chunk in enumerate(chunks):
+            metadata = dict(chunk.get("metadata") or {})
+            metadata["session_id"] = str(session.id)
+            metadata["connection_id"] = str(connection_id)
+            metadata["chunk_index"] = idx
             all_metadatas.append(metadata)
-            all_ids.append(f"schema_{connection_id}_{chunk['metadata'].get('chunk_type', 'text')}_{i}")
-        
-        # Add to ChromaDB
+            all_ids.append(f"schema_{connection_id}_{session.id}_{idx}")
+
         chromadb_service.add_documents(
             collection_name=collection_name,
             texts=all_texts,
@@ -1527,15 +1858,28 @@ async def process_database_schema(
             metadatas=all_metadatas,
             ids=all_ids
         )
-        
-        # Update schema to mark as processed
-        schema.is_processed = 1
-        schema.session_id = session.id
+
+        session_schema.is_processed = 1
+        session_schema.updated_at = datetime.utcnow()
         db.commit()
-        
-        # Build preview
+
         preview_text = schema_text[:2000] if schema_text else "Schema processed successfully"
-        
+
+        if preview_text and preview_text.strip():
+            summary_message = ChatMessageModel(
+                session_id=session.id,
+                role="assistant",
+                message=preview_text,
+                meta_data={
+                    "summary": True,
+                    "schema_processed": True,
+                    "timestamp": datetime.utcnow().isoformat()
+                },
+                created_at=datetime.utcnow()
+            )
+            db.add(summary_message)
+            db.commit()
+
         return {
             "success": True,
             "session_id": session.id,
@@ -1543,6 +1887,15 @@ async def process_database_schema(
             "total_chunks": len(chunks),
             "message": "Schema processed and vectorized successfully",
             "used_embedding_model": embedding_model_name,
+            "session_created": session_created,
+            "session": {
+                "id": session.id,
+                "name": session.session_name,
+                "created_at": session.created_at.isoformat(),
+                "connection_id": connection_id,
+                "hasVectorizedData": True,
+                "session_type": "database"
+            },
             "preview": {
                 "summary": preview_text
             }
@@ -1551,6 +1904,107 @@ async def process_database_schema(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process schema: {str(e)}")
+
+
+@app.post("/api/database/sessions")
+async def create_database_session(
+    session_data: dict,
+    db: Session = Depends(get_db)
+):
+    """Create a brand new chat session for a database connection (no vectors yet)."""
+    try:
+        connection_id = session_data.get("connection_id")
+        if not connection_id:
+            raise HTTPException(status_code=400, detail="connection_id is required")
+
+        connection = db.query(DatabaseConnection).filter(DatabaseConnection.id == connection_id).first()
+        if not connection:
+            raise HTTPException(status_code=404, detail="Database connection not found")
+
+        # Locate base schema (session_id is NULL)
+        base_schema = (
+            db.query(DatabaseSchema)
+            .filter(
+                DatabaseSchema.connection_id == connection_id,
+                DatabaseSchema.session_id.is_(None)
+            )
+            .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
+            .first()
+        )
+
+        if not base_schema:
+            base_schema = (
+                db.query(DatabaseSchema)
+                .filter(DatabaseSchema.connection_id == connection_id)
+                .order_by(DatabaseSchema.updated_at.desc(), DatabaseSchema.created_at.desc())
+                .first()
+            )
+
+        if not base_schema or not base_schema.schema_data:
+            raise HTTPException(
+                status_code=400,
+                detail="Extract the schema for this connection before creating a chat session."
+            )
+
+        user_id = session_data.get("user_id", connection.user_id if hasattr(connection, "user_id") else 1)
+        llm_model_id = session_data.get("llm_model_id")
+
+        if not llm_model_id:
+            default_llm = (
+                db.query(LLMModel)
+                .filter(LLMModel.is_active == 1)
+                .order_by(LLMModel.id)
+                .first()
+            ) or db.query(LLMModel).order_by(LLMModel.id).first()
+            if not default_llm:
+                raise HTTPException(status_code=400, detail="No LLM models are configured. Add an LLM model first.")
+            llm_model_id = default_llm.id
+
+        session_name = session_data.get(
+            "session_name",
+            f"{connection.name} Session {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        new_session = ChatSession(
+            user_id=user_id,
+            session_name=session_name,
+            llm_model_id=llm_model_id,
+            embedding_model_id=None,
+            created_at=datetime.utcnow()
+        )
+        db.add(new_session)
+        db.commit()
+        db.refresh(new_session)
+
+        # Create a schema record bound to this session (marked as not processed)
+        session_schema = DatabaseSchema(
+            connection_id=connection_id,
+            session_id=new_session.id,
+            schema_data=copy.deepcopy(base_schema.schema_data or {}),
+            schema_text=base_schema.schema_text or "",
+            is_processed=0,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.add(session_schema)
+        db.commit()
+
+        return {
+            "success": True,
+            "message": "New database chat session created. Process the schema before chatting.",
+            "session": {
+                "id": new_session.id,
+                "name": new_session.session_name,
+                "created_at": new_session.created_at.isoformat(),
+                "connection_id": connection_id,
+                "hasVectorizedData": False,
+                "session_type": "database"
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create database session: {str(e)}")
 
 @app.post("/api/database/chat")
 async def database_chat(
@@ -1584,17 +2038,55 @@ async def database_chat(
             "api_key": model.api_key if hasattr(model, 'api_key') else None
         }
         
-        # Get database connection and schema
-        schema = db.query(DatabaseSchema).filter(DatabaseSchema.session_id == session_id).first()
+        # Locate the schema for this session
+        schema = (
+            db.query(DatabaseSchema)
+            .filter(DatabaseSchema.session_id == session_id)
+            .first()
+        )
         if not schema:
             raise HTTPException(status_code=404, detail="Schema not found for this session")
-        
+
         connection = db.query(DatabaseConnection).filter(
             DatabaseConnection.id == schema.connection_id
         ).first()
         if not connection:
             raise HTTPException(status_code=404, detail="Database connection not found")
+        connection_id = connection.id
+
+        if not schema.is_processed:
+            raise HTTPException(
+                status_code=400,
+                detail="This session has not been processed yet. Process & vectorize the schema before chatting."
+            )
         
+        # Ensure the session has a vector store; rebuild if needed
+        collection_name = f"db_session_{session_id}"
+        try:
+            existing_collections = chromadb_service.list_collections()
+        except Exception:
+            existing_collections = []
+
+        if schema.is_processed and collection_name not in existing_collections:
+            try:
+                rebuilt = _vectorize_schema_for_session(
+                    db,
+                    session,
+                    schema,
+                    connection,
+                    embedding_model_name=None
+                )
+                if rebuilt:
+                    existing_collections = chromadb_service.list_collections()
+            except Exception as rebuild_error:
+                print(f"[Chat] Failed to rebuild vectors for session {session_id}: {rebuild_error}")
+
+        if collection_name not in existing_collections:
+            raise HTTPException(
+                status_code=400,
+                detail="This session has not been processed yet. Process the schema before chatting."
+            )
+
         # Create agent system with model config and services for semantic search
         agent_llm_service = LLMService()
         # Create agent system with model config and embedding/chromadb services
@@ -1611,16 +2103,35 @@ async def database_chat(
             ChatMessageModel.session_id == session_id
         ).order_by(ChatMessageModel.created_at).limit(10).all()
         
-        previous_context = [
-            {"role": msg.role, "content": msg.message} 
-            for msg in previous_messages
-        ] if previous_messages else None
-        
-        # Collection name for semantic search
-        collection_name = f"db_session_{session_id}"
-        
         # Get embedding model name (use default if not specified)
         embedding_model_name = get_default_embedding_model()
+        
+        # Build condensed conversation summary (prefer vectorized history)
+        conversation_summary = None
+        try:
+            collections = chromadb_service.list_collections()
+            if collection_name in collections:
+                conversation_summary = _build_condensed_chat_summary(
+                    chromadb_service,
+                    embedding_service,
+                    collection_name,
+                    message,
+                    embedding_model_name,
+                    fallback_messages=previous_messages
+                )
+        except Exception as e:
+            print(f"[Chat] Unable to build conversation summary from vectors: {str(e)}")
+        
+        if not conversation_summary and previous_messages:
+            fallback_lines = []
+            for msg in previous_messages[-5:]:
+                role = msg.role.title()
+                text = (msg.message or "").strip().replace("\n", " ")
+                if len(text) > 200:
+                    text = text[:197] + "..."
+                fallback_lines.append(f"{role}: {text}")
+            if fallback_lines:
+                conversation_summary = "Recent conversation highlights:\n" + "\n".join(f"- {line}" for line in fallback_lines)
         
         # Process query through agent system with semantic search
         agent_result = db_agent_system.process_query(
@@ -1635,7 +2146,12 @@ async def database_chat(
             port=connection.port,
             database_name=connection.database_name,
             username=connection.username,
-            password=connection.password
+            password=connection.password,
+            conversation_summary=conversation_summary,
+            previous_messages=[
+                {"role": m.role, "content": m.message}
+                for m in previous_messages
+            ] if previous_messages else None
         )
         
         # Prepare response
@@ -1650,6 +2166,13 @@ async def database_chat(
             "sql_validation": agent_result.get('sql_validation', {}),
             "relevant_schema_parts_count": len(relevant_schema_parts),
             "used_semantic_search": len(relevant_schema_parts) > 0
+        }
+        table_selection_info = agent_result.get('table_selection') or {}
+        metadata["table_selection"] = {
+            "enabled": bool(table_selection_info),
+            "selected_tables": table_selection_info.get('selected_tables', []),
+            "confidence": table_selection_info.get('confidence'),
+            "method": table_selection_info.get('selection_method')
         }
         
         # If SQL should be executed
@@ -1703,6 +2226,16 @@ async def database_chat(
                             'columns': columns,
                             'data': []
                         }
+                    analysis_text = _generate_result_analysis(
+                        agent_llm_service,
+                        message,
+                        agent_result['sql'],
+                        metadata['query_result']['data'],
+                        model_config
+                    )
+                    if analysis_text:
+                        metadata['analysis'] = analysis_text
+                        response_text += "\n\n" + analysis_text
                 except Exception as e:
                     # If formatting fails, provide a simple response with data
                     import logging
@@ -1728,6 +2261,16 @@ async def database_chat(
                         'columns': columns,
                         'data': query_data[:100] if len(query_data) > 100 else query_data
                     }
+                    analysis_text = _generate_result_analysis(
+                        agent_llm_service,
+                        message,
+                        agent_result['sql'],
+                        metadata['query_result']['data'],
+                        model_config
+                    )
+                    if analysis_text:
+                        metadata['analysis'] = analysis_text
+                        response_text += "\n\n" + analysis_text
             else:
                 # SQL execution failed - provide user-friendly error message
                 error_msg = sql_result.get('error', 'Unknown error occurred')
@@ -1861,9 +2404,16 @@ async def database_chat(
             "metadata": {
                 "intent": metadata.get('intent', {}),
                 "used_semantic_search": metadata.get('used_semantic_search', False),
-                "relevant_schema_parts_count": metadata.get('relevant_schema_parts_count', 0)
+                "relevant_schema_parts_count": metadata.get('relevant_schema_parts_count', 0),
+                "table_selection": metadata.get('table_selection')
             }
         }
+        if table_selection_info:
+            response_data["table_selection"] = {
+                "selected_tables": table_selection_info.get('selected_tables', []),
+                "confidence": table_selection_info.get('confidence'),
+                "method": table_selection_info.get('selection_method')
+            }
         
         # Only include SQL in response if execution was successful
         if sql_executed and query_result and query_result.get('success'):
@@ -1890,6 +2440,8 @@ async def database_chat(
                     response_data["query_result_columns"] = list(query_data[0].keys())
                 else:
                     response_data["query_result_columns"] = []
+                if metadata.get('analysis'):
+                    response_data["analysis"] = metadata['analysis']
             else:
                 # No data returned, but query was successful (e.g., INSERT/UPDATE/DELETE)
                 response_data["query_result"] = []
@@ -1938,10 +2490,117 @@ async def get_database_schema(
         "session_id": schema.session_id,
         "schema_data": schema.schema_data,
         "schema_text": schema.schema_text,
-        "is_processed": schema.is_processed,
-        "created_at": schema.created_at.isoformat(),
+        "is_processed": bool(schema.is_processed),
+        "created_at": schema.created_at.isoformat() if schema.created_at else None,
         "updated_at": schema.updated_at.isoformat() if schema.updated_at else None
     }
+
+
+@app.post("/api/database/knowledge")
+async def upload_database_knowledge(
+    connection_id: Optional[int] = Form(None),
+    session_id: Optional[int] = Form(None),
+    user_id: int = Form(1),
+    title: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    """Upload knowledge document for database chat"""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="File must have a filename")
+    
+    filename = file.filename
+    ext = os.path.splitext(filename)[1] or ""
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    save_path = os.path.join(KNOWLEDGE_UPLOAD_DIR, unique_name)
+    
+    try:
+        async with aiofiles.open(save_path, "wb") as out_file:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                await out_file.write(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to store file: {str(e)}")
+    
+    knowledge = DatabaseKnowledge(
+        connection_id=connection_id,
+        session_id=session_id,
+        user_id=user_id,
+        title=title or os.path.splitext(filename)[0],
+        description=description,
+        original_filename=filename,
+        file_path=save_path,
+        file_type=ext.lstrip(".").lower(),
+        content_type=file.content_type,
+        tags=None,
+    )
+    
+    db.add(knowledge)
+    db.commit()
+    db.refresh(knowledge)
+    
+    return _serialize_knowledge_item(knowledge)
+
+
+@app.get("/api/database/knowledge")
+async def list_database_knowledge(
+    connection_id: Optional[int] = None,
+    session_id: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
+    """List uploaded knowledge documents"""
+    query = db.query(DatabaseKnowledge)
+    if connection_id is not None:
+        query = query.filter(DatabaseKnowledge.connection_id == connection_id)
+    if session_id is not None:
+        query = query.filter(DatabaseKnowledge.session_id == session_id)
+    items = query.order_by(DatabaseKnowledge.created_at.desc()).all()
+    return [_serialize_knowledge_item(item) for item in items]
+
+
+@app.get("/api/database/knowledge/{knowledge_id}/download")
+async def download_database_knowledge(
+    knowledge_id: int,
+    db: Session = Depends(get_db)
+):
+    """Download a knowledge document"""
+    knowledge = db.query(DatabaseKnowledge).filter(DatabaseKnowledge.id == knowledge_id).first()
+    if not knowledge:
+        raise HTTPException(status_code=404, detail="Knowledge document not found")
+    
+    if not os.path.exists(knowledge.file_path):
+        raise HTTPException(status_code=404, detail="File not found on server")
+    
+    filename = knowledge.original_filename or os.path.basename(knowledge.file_path)
+    media_type = knowledge.content_type or "application/octet-stream"
+    return FileResponse(knowledge.file_path, media_type=media_type, filename=filename)
+
+
+@app.delete("/api/database/knowledge/{knowledge_id}")
+async def delete_database_knowledge(
+    knowledge_id: int,
+    db: Session = Depends(get_db)
+):
+    """Delete knowledge document"""
+    knowledge = db.query(DatabaseKnowledge).filter(DatabaseKnowledge.id == knowledge_id).first()
+    if not knowledge:
+        raise HTTPException(status_code=404, detail="Knowledge document not found")
+    
+    file_path = knowledge.file_path
+    
+    db.delete(knowledge)
+    db.commit()
+    
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+    
+    return {"success": True}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

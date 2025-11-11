@@ -70,6 +70,29 @@
   overflow: hidden;
 }
 
+.database-chat-tabs {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.database-chat-tabs .ant-tabs-nav {
+  margin-bottom: 16px;
+}
+
+.database-chat-tabs .ant-tabs-content-holder {
+  flex: 1;
+  min-height: 0;
+}
+
+.database-chat-tabs .ant-tabs-content {
+  height: 100%;
+}
+
+.database-chat-tabs .ant-tabs-tabpane {
+  height: 100%;
+}
+
 .chat-messages-container {
   flex: 1;
   overflow-y: auto;
