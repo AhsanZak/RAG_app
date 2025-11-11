@@ -387,6 +387,44 @@ def _vectorize_schema_for_session(
 
     return True
 
+def _generate_result_analysis(
+    llm_service: "LLMService",
+    user_query: str,
+    executed_sql: str,
+    result_rows: List[Dict[str, Any]],
+    model_config: Dict[str, Any],
+    max_rows: int = 8
+) -> Optional[str]:
+    """Ask the LLM to analyze query results and produce a narrative summary."""
+    if not result_rows:
+        return None
+
+    try:
+        sample_rows = result_rows[:max_rows]
+        rows_text = json.dumps(sample_rows, indent=2, default=str)
+
+        prompt = (
+            "You are a senior data analyst. Review the SQL query, the user's request, and the returned data.\n"
+            "Provide a concise natural-language explanation that links the findings back to the user's intent.\n"
+            "Highlight notable patterns, relationships (e.g., rental counts, actor popularity), or factors that explain the results.\n"
+            "If the data alone is insufficient to fully answer the user's question, mention what evidence is available and what is missing.\n"
+            "Do not invent facts beyond the dataset.\n\n"
+            f"User Query:\n{user_query}\n\n"
+            f"Executed SQL:\n{executed_sql}\n\n"
+            f"Result Sample (JSON):\n{rows_text}\n\n"
+            "Respond with one or two paragraphs summarizing the key insights, using field names from the data when relevant."
+        )
+
+        analysis = llm_service.generate_response(
+            messages=[{"role": "user", "content": prompt}],
+            model_config=model_config,
+            temperature=0.5
+        )
+        return analysis.strip()
+    except Exception as analysis_error:
+        print(f"[ResultAnalysis] Unable to generate analysis: {analysis_error}")
+        return None
+
 from services.pdf_processor import PDFProcessor
 from services.embedding_service import EmbeddingService
 from services.chromadb_service import ChromaDBService
@@ -1690,7 +1728,15 @@ async def process_database_schema(
         if embedding_model_name and not get_embedding_model_info(embedding_model_name):
             embedding_model_name = None
         if not embedding_model_name:
-            embedding_model_name = get_default_embedding_model()
+            session_schema_meta = None
+            if isinstance(base_schema.schema_data, dict):
+                session_schema_meta = base_schema.schema_data.get("_meta")
+            if isinstance(session_schema_meta, dict):
+                stored_model = session_schema_meta.get("embedding_model")
+                if stored_model and get_embedding_model_info(stored_model):
+                    embedding_model_name = stored_model
+            if not embedding_model_name:
+                embedding_model_name = get_default_embedding_model()
 
         # Resolve LLM model ID
         llm_model_id = requested_llm_model_id
@@ -2091,7 +2137,11 @@ async def database_chat(
             database_name=connection.database_name,
             username=connection.username,
             password=connection.password,
-            conversation_summary=conversation_summary
+            conversation_summary=conversation_summary,
+            previous_messages=[
+                {"role": m.role, "content": m.message}
+                for m in previous_messages
+            ] if previous_messages else None
         )
         
         # Prepare response
@@ -2166,6 +2216,16 @@ async def database_chat(
                             'columns': columns,
                             'data': []
                         }
+                    analysis_text = _generate_result_analysis(
+                        agent_llm_service,
+                        message,
+                        agent_result['sql'],
+                        metadata['query_result']['data'],
+                        model_config
+                    )
+                    if analysis_text:
+                        metadata['analysis'] = analysis_text
+                        response_text += "\n\n" + analysis_text
                 except Exception as e:
                     # If formatting fails, provide a simple response with data
                     import logging
@@ -2191,6 +2251,16 @@ async def database_chat(
                         'columns': columns,
                         'data': query_data[:100] if len(query_data) > 100 else query_data
                     }
+                    analysis_text = _generate_result_analysis(
+                        agent_llm_service,
+                        message,
+                        agent_result['sql'],
+                        metadata['query_result']['data'],
+                        model_config
+                    )
+                    if analysis_text:
+                        metadata['analysis'] = analysis_text
+                        response_text += "\n\n" + analysis_text
             else:
                 # SQL execution failed - provide user-friendly error message
                 error_msg = sql_result.get('error', 'Unknown error occurred')
@@ -2360,6 +2430,8 @@ async def database_chat(
                     response_data["query_result_columns"] = list(query_data[0].keys())
                 else:
                     response_data["query_result_columns"] = []
+                if metadata.get('analysis'):
+                    response_data["analysis"] = metadata['analysis']
             else:
                 # No data returned, but query was successful (e.g., INSERT/UPDATE/DELETE)
                 response_data["query_result"] = []

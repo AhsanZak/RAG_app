@@ -1003,6 +1003,7 @@ class DatabaseAgentSystem:
         embedding_model_name: Optional[str] = None,
         connection_string: Optional[str] = None,
         conversation_summary: Optional[str] = None,
+        previous_messages: Optional[List[Dict[str, Any]]] = None,
         **connection_params
     ) -> Dict[str, Any]:
         """
@@ -1080,6 +1081,10 @@ class DatabaseAgentSystem:
         
         # Step 2b: Generate SQL using semantic search for relevant schema parts
         result['requires_sql'] = True
+        recent_context = None
+        if previous_messages:
+            recent_context = previous_messages[-6:]
+
         sql_result = self.nl_to_sql_agent.generate_sql(
             user_query,
             schema_details,
@@ -1087,6 +1092,7 @@ class DatabaseAgentSystem:
             collection_name=collection_name,
             embedding_model_name=embedding_model_name,
             conversation_summary=conversation_summary,
+            conversation_context=recent_context,
             selected_tables=selected_tables,
             table_context_chunks=table_context_chunks
         )
@@ -1139,6 +1145,7 @@ class DatabaseAgentSystem:
                     collection_name=collection_name,
                     embedding_model_name=embedding_model_name,
                     conversation_summary=summary_for_refinement,
+                    conversation_context=recent_context,
                     selected_tables=selected_tables,
                     table_context_chunks=table_context_chunks,
                     additional_guidance=guidance_text

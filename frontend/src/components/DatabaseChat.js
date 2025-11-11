@@ -758,6 +758,7 @@ const DatabaseChat = ({ onBack }) => {
               queryResultCount: rowCount
             })
           : null;
+        const analysis = metadata.analysis || null;
 
         return {
           id: msg.id,
@@ -770,6 +771,7 @@ const DatabaseChat = ({ onBack }) => {
           queryResult: queryData,
           queryResultCount: rowCount,
           queryResultColumns: queryColumns,
+          analysis,
           processTrace,
         };
       });
@@ -907,7 +909,7 @@ const DatabaseChat = ({ onBack }) => {
         if (successSummary) {
           setChatMessages(prev => {
             const alreadyPresent = prev.some(
-              msg => msg.metadata?.summary && msg.content === successSummary
+              msg => (msg.metadata?.summary || msg.metadata?.analysis) && msg.content === successSummary
             );
             if (alreadyPresent) {
               return prev;
@@ -921,7 +923,8 @@ const DatabaseChat = ({ onBack }) => {
                 timestamp: new Date(),
                 metadata: {
                   summary: true,
-                  schema_processed: true
+                  schema_processed: true,
+                  analysis: successSummary
                 }
               }
             ];
@@ -1081,6 +1084,7 @@ const DatabaseChat = ({ onBack }) => {
         queryResultCount: response.query_result_count || queryResultArray.length,
         queryResultColumns: queryResultColumns,
         metadata: response.metadata || {},
+        analysis: response.analysis || (response.metadata && response.metadata.analysis) || null,
         processTrace
       };
 
@@ -1456,6 +1460,12 @@ const DatabaseChat = ({ onBack }) => {
                               </div>
                             )}
                           </div>
+                        </div>
+                      )}
+                      {message.analysis && (
+                        <div style={{ marginTop: 12, padding: 12, background: '#f0f5ff', borderRadius: 4 }}>
+                          <Text strong style={{ fontSize: '12px' }}>Analysis:</Text>
+                          <Paragraph style={{ marginTop: 4 }}>{message.analysis}</Paragraph>
                         </div>
                       )}
                     </div>
