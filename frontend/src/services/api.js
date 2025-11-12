@@ -226,13 +226,17 @@ export const databaseChatAPI = {
   },
 
   // Chat with database schema
-  chat: async (sessionId, message, modelId) => {
-    const response = await api.post('/api/database/chat', {
+  chat: async (sessionId, message, modelId, databaseType) => {
+    const payload = {
       session_id: sessionId,
       message: message,
       model_id: modelId,
       user_id: 1
-    });
+    };
+    if (databaseType) {
+      payload.database_type = databaseType;
+    }
+    const response = await api.post('/api/database/chat', payload);
     return response.data;
   },
 

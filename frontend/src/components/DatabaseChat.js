@@ -1041,10 +1041,17 @@ const DatabaseChat = ({ onBack }) => {
 
     setIsProcessingMessage(true);
     try {
+      let databaseType;
+      if (currentConnection?.database_type) {
+        const normalized = String(currentConnection.database_type).trim().toLowerCase();
+        databaseType = normalized || undefined;
+      }
+
       const response = await databaseChatAPI.chat(
         currentSession.id,
         messageText,
-        modelToUse
+        modelToUse,
+        databaseType
       );
 
       // Debug: Log the response to see what we're getting

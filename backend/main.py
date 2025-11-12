@@ -2054,6 +2054,32 @@ async def database_chat(
             raise HTTPException(status_code=404, detail="Database connection not found")
         connection_id = connection.id
 
+        # Determine effective database type (allow override from request payload)
+        def _normalize_db_type(value):
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                return normalized or None
+            return None
+
+        request_database_type = _normalize_db_type(chat_data.get("database_type"))
+        connection_database_type = _normalize_db_type(connection.database_type)
+        database_type = request_database_type or connection_database_type
+        if not database_type:
+            database_type = "unknown"
+
+        # Ensure schema details include database type metadata before passing to agents
+        raw_schema_details = schema.schema_data or {}
+        if isinstance(raw_schema_details, dict):
+            schema_details = copy.deepcopy(raw_schema_details)
+        else:
+            schema_details = {}
+        schema_details.setdefault("database_type", database_type)
+        metadata_block = schema_details.get("metadata")
+        if isinstance(metadata_block, dict):
+            metadata_block.setdefault("database_type", database_type)
+        else:
+            schema_details["metadata"] = {"database_type": database_type}
+
         if not schema.is_processed:
             raise HTTPException(
                 status_code=400,
@@ -2136,9 +2162,9 @@ async def database_chat(
         # Process query through agent system with semantic search
         agent_result = db_agent_system.process_query(
             user_query=message,
-            schema_details=schema.schema_data,
+            schema_details=schema_details,
             schema_text=schema.schema_text or "",
-            database_type=connection.database_type,
+            database_type=database_type,
             collection_name=collection_name,  # For semantic search
             embedding_model_name=embedding_model_name,  # For semantic search
             connection_string=connection.connection_string,
@@ -2165,7 +2191,8 @@ async def database_chat(
             "sql": agent_result.get('sql'),
             "sql_validation": agent_result.get('sql_validation', {}),
             "relevant_schema_parts_count": len(relevant_schema_parts),
-            "used_semantic_search": len(relevant_schema_parts) > 0
+            "used_semantic_search": len(relevant_schema_parts) > 0,
+            "database_type": database_type
         }
         table_selection_info = agent_result.get('table_selection') or {}
         metadata["table_selection"] = {
@@ -2181,7 +2208,7 @@ async def database_chat(
             print(f"[DEBUG] Executing SQL: {agent_result['sql']}")
             sql_result = sql_execution_service.execute_query(
                 sql=agent_result['sql'],
-                database_type=connection.database_type,
+                database_type=database_type,
                 connection_string=connection.connection_string,
                 host=connection.host,
                 port=connection.port,
@@ -2405,7 +2432,8 @@ async def database_chat(
                 "intent": metadata.get('intent', {}),
                 "used_semantic_search": metadata.get('used_semantic_search', False),
                 "relevant_schema_parts_count": metadata.get('relevant_schema_parts_count', 0),
-                "table_selection": metadata.get('table_selection')
+                "table_selection": metadata.get('table_selection'),
+                "database_type": metadata.get('database_type')
             }
         }
         if table_selection_info:

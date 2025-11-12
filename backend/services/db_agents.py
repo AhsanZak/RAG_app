@@ -598,6 +598,41 @@ Database Type: {database_type.upper()}
 - The semantic chunks show DETAILED information about columns relevant to your query
 - Combine both sources to ensure accurate SQL generation
 - If a table/column is mentioned in the query but not found in the schema, exclude it and note this in reasoning
+"""
+
+        database_specific_instructions: List[str] = []
+        db_type_lower = (database_type or "").lower()
+        if db_type_lower in ("postgresql", "postgres"):
+            database_specific_instructions.extend([
+                "- PostgreSQL requires every non-aggregated column in the SELECT clause to also appear in the GROUP BY clause.",
+                "- Prefer double quotes for identifiers only when necessary; avoid MySQL-style backticks.",
+                "- Use || for string concatenation and remember boolean literals (TRUE/FALSE)."
+            ])
+        elif db_type_lower in ("mysql", "mariadb"):
+            database_specific_instructions.extend([
+                "- Use backticks (`) for identifiers only if they contain special characters.",
+                "- LIMIT uses `LIMIT <rows>` and OFFSET can use `LIMIT <offset>, <rows>` or `LIMIT <rows> OFFSET <offset>`.",
+                "- Remember that boolean comparisons often use 0/1 in MySQL."
+            ])
+        elif db_type_lower in ("mssql", "sqlserver"):
+            database_specific_instructions.extend([
+                "- Use TOP or OFFSET/FETCH NEXT for limiting rows.",
+                "- Square brackets [] are used for identifiers with special characters.",
+                "- DATETIME functions (e.g., GETDATE()) differ from other SQL dialects."
+            ])
+        elif db_type_lower in ("oracle",):
+            database_specific_instructions.extend([
+                "- Use ROWNUM or FETCH FIRST ... ROWS ONLY to limit rows.",
+                "- Remember to use TO_DATE/TO_CHAR for date conversions.",
+                "- Oracle uses NVL instead of COALESCE in some legacy cases."
+            ])
+
+        if database_specific_instructions:
+            prompt += "\n=== DATABASE-SPECIFIC GUIDELINES ===\n"
+            prompt += "\n".join(database_specific_instructions)
+            prompt += "\n"
+
+        prompt += """
 
 === OUTPUT FORMAT ===
 Respond in JSON format:
@@ -817,8 +852,13 @@ Respond in JSON format:
                     raw_warnings = result.get('warnings', [])
                     user_friendly_errors = []
                     for error in raw_errors:
-                        error_lower = str(error).lower()
-                        if 'table' in error_lower or 'does not exist' in error_lower:
+                        error_text = str(error)
+                        error_lower = error_text.lower()
+                        if 'group by' in error_lower and ('aggregate' in error_lower or 'must appear' in error_lower):
+                            user_friendly_errors.append(
+                                "Aggregation error: every non-aggregated column must be included in the GROUP BY clause."
+                            )
+                        elif 'table' in error_lower or 'column' in error_lower or 'does not exist' in error_lower:
                             user_friendly_errors.append("Table or column mismatch")
                         elif 'syntax' in error_lower or 'invalid' in error_lower:
                             user_friendly_errors.append("Syntax issue detected")
@@ -826,6 +866,8 @@ Respond in JSON format:
                             user_friendly_errors.append("Data type mismatch")
                         else:
                             user_friendly_errors.append("Validation issue")
+                    if not user_friendly_errors and raw_errors:
+                        user_friendly_errors = [str(err) for err in raw_errors]
                     
                     # Only return corrected SQL if validation passed
                     corrected_sql = None
