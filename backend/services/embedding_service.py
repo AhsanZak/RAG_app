@@ -11,6 +11,7 @@ from typing import List, Dict, Optional, Any
 import numpy as np
 import os
 import threading
+import time
 
 # Try to ensure huggingface_hub is available
 try:
@@ -20,6 +21,12 @@ except ImportError:
     print("Warning: huggingface_hub not found. Installing it might be required.")
     huggingface_hub = None
     snapshot_download = None
+
+# Global state to track DLL loading failures
+_DLL_LOAD_FAILED = False
+_DLL_FAILURE_LOCK = threading.Lock()
+_DLL_RETRY_COUNT = 0
+_MAX_DLL_RETRIES = 3  # Maximum retries for intermittent DLL failures
 
 
 class RemoteSentenceTransformer:
@@ -111,20 +118,49 @@ class RemoteSentenceTransformer:
 
 def _import_sentence_transformer():
     """Lazy import for SentenceTransformer to avoid DLL load issues on Windows."""
-    global SentenceTransformer
+    global SentenceTransformer, _DLL_LOAD_FAILED, _DLL_RETRY_COUNT
+    
+    # Check if we should prefer remote embeddings
+    prefer_remote = os.getenv("PREFER_REMOTE_EMBEDDINGS", "").lower() in ("true", "1", "yes")
+    
+    # If DLL loading has failed multiple times, skip retry unless explicitly requested
+    with _DLL_FAILURE_LOCK:
+        if _DLL_LOAD_FAILED and _DLL_RETRY_COUNT >= _MAX_DLL_RETRIES and not prefer_remote:
+            raise ImportError(
+                "SentenceTransformer not available due to persistent DLL load issues. "
+                "Set PREFER_REMOTE_EMBEDDINGS=true to use Hugging Face API, or set HUGGINGFACE_API_TOKEN for automatic fallback."
+            )
+    
     if SentenceTransformer is None:
         try:
             from sentence_transformers import SentenceTransformer as ST
             SentenceTransformer = ST
+            # Reset failure state on successful import
+            with _DLL_FAILURE_LOCK:
+                _DLL_LOAD_FAILED = False
+                _DLL_RETRY_COUNT = 0
         except (OSError, ImportError) as e:
             error_msg = str(e)
-            if "DLL" in error_msg or "dll" in error_msg.lower() or "1114" in error_msg:
-                print(f"[ERROR] PyTorch DLL loading issue: {error_msg}")
-                print("[INFO] Suggested fixes:")
-                print("  1. Install Microsoft Visual C++ Redistributable 2015-2022")
-                print("  2. Reinstall PyTorch: pip uninstall torch && pip install torch")
-                print("  3. Use CPU-only torch build: pip install torch --index-url https://download.pytorch.org/whl/cpu")
-                print("  4. Restart your machine after installing dependencies")
+            is_dll_error = "DLL" in error_msg or "dll" in error_msg.lower() or "1114" in error_msg
+            
+            if is_dll_error:
+                with _DLL_FAILURE_LOCK:
+                    _DLL_LOAD_FAILED = True
+                    _DLL_RETRY_COUNT += 1
+                
+                print(f"[ERROR] PyTorch DLL loading issue (attempt {_DLL_RETRY_COUNT}/{_MAX_DLL_RETRIES}): {error_msg}")
+                
+                if _DLL_RETRY_COUNT < _MAX_DLL_RETRIES:
+                    print(f"[INFO] Will retry after a short delay. If this persists, consider:")
+                else:
+                    print("[INFO] Maximum retries reached. Suggested fixes:")
+                    print("  1. Install Microsoft Visual C++ Redistributable 2015-2022")
+                    print("  2. Reinstall PyTorch: pip uninstall torch && pip install torch")
+                    print("  3. Use CPU-only torch build: pip install torch --index-url https://download.pytorch.org/whl/cpu")
+                    print("  4. Set PREFER_REMOTE_EMBEDDINGS=true to use Hugging Face API")
+                    print("  5. Set HUGGINGFACE_API_TOKEN for automatic fallback")
+                    print("  6. Restart your machine after installing dependencies")
+                
                 raise ImportError("SentenceTransformer not available due to DLL load issue") from e
             raise
     return SentenceTransformer
@@ -143,12 +179,22 @@ class EmbeddingService:
         self.default_model_name = default_model_name
         self.loaded_models: Dict[str, Any] = {}
         self.loading_models: Dict[str, threading.Lock] = {}
+        self.failed_models: Dict[str, Exception] = {}  # Track failed model loads
+        self.prefer_remote = os.getenv("PREFER_REMOTE_EMBEDDINGS", "").lower() in ("true", "1", "yes")
         # Do not load model during init to avoid DLL issues; load on demand.
     
     def _load_model(self, model_name: str):
-        """Load a sentence transformer model"""
+        """Load a sentence transformer model with automatic fallback to remote API"""
         if model_name in self.loaded_models:
             return self.loaded_models[model_name]
+        
+        # If this model previously failed and we prefer remote, skip local attempt
+        if model_name in self.failed_models and self.prefer_remote:
+            print(f"[INFO] Model '{model_name}' previously failed locally. Using remote API.")
+            fallback_model = self._create_remote_model(model_name)
+            if fallback_model is not None:
+                self.loaded_models[model_name] = fallback_model
+                return fallback_model
         
         # Use lock to prevent concurrent loading of same model
         if model_name not in self.loading_models:
@@ -159,26 +205,75 @@ class EmbeddingService:
             if model_name in self.loaded_models:
                 return self.loaded_models[model_name]
             
-            try:
-                print(f"Loading embedding model: {model_name}")
-                ST = _import_sentence_transformer()
-                model = ST(model_name)
-                self.loaded_models[model_name] = model
-                print(f"Embedding model '{model_name}' loaded successfully")
-                return model
-            except Exception as e:
-                # Attempt remote fallback via Hugging Face Inference API
-                print(f"[WARNING] Local SentenceTransformer load failed: {e}")
-                print("[INFO] Attempting fallback via Hugging Face Inference API.")
+            # Try remote first if preferred
+            if self.prefer_remote:
+                print(f"[INFO] PREFER_REMOTE_EMBEDDINGS is set. Using Hugging Face API for '{model_name}'.")
                 fallback_model = self._create_remote_model(model_name)
                 if fallback_model is not None:
                     self.loaded_models[model_name] = fallback_model
                     print(f"Using Hugging Face Inference API for model '{model_name}'.")
                     return fallback_model
-                raise Exception(
-                    f"Failed to load embedding model '{model_name}': {str(e)}. "
-                    "No fallback embedding provider available."
-                )
+                print("[WARNING] Remote embedding failed, falling back to local model.")
+            
+            # Try local model with retry logic for intermittent DLL failures
+            max_retries = 3
+            retry_delay = 0.5  # Start with 0.5 seconds
+            
+            for attempt in range(max_retries):
+                try:
+                    print(f"Loading embedding model: {model_name} (attempt {attempt + 1}/{max_retries})")
+                    ST = _import_sentence_transformer()
+                    model = ST(model_name)
+                    self.loaded_models[model_name] = model
+                    # Clear any previous failure record
+                    self.failed_models.pop(model_name, None)
+                    print(f"Embedding model '{model_name}' loaded successfully")
+                    return model
+                except ImportError as e:
+                    # DLL or import error - try remote fallback
+                    error_msg = str(e).lower()
+                    if "dll" in error_msg or "1114" in error_msg:
+                        print(f"[WARNING] Local SentenceTransformer load failed (attempt {attempt + 1}): {e}")
+                        if attempt < max_retries - 1:
+                            print(f"[INFO] Retrying in {retry_delay} seconds...")
+                            time.sleep(retry_delay)
+                            retry_delay *= 2  # Exponential backoff
+                            continue
+                        
+                        # After all retries, try remote fallback
+                        print("[INFO] All local retries exhausted. Attempting fallback via Hugging Face Inference API.")
+                        fallback_model = self._create_remote_model(model_name)
+                        if fallback_model is not None:
+                            self.loaded_models[model_name] = fallback_model
+                            print(f"Using Hugging Face Inference API for model '{model_name}'.")
+                            return fallback_model
+                        
+                        # Store failure for future reference
+                        self.failed_models[model_name] = e
+                        raise Exception(
+                            f"Failed to load embedding model '{model_name}' after {max_retries} attempts: {str(e)}. "
+                            "Set HUGGINGFACE_API_TOKEN environment variable to enable remote embeddings fallback."
+                        ) from e
+                    else:
+                        # Other import errors - don't retry
+                        raise
+                except Exception as e:
+                    # Other errors - try remote fallback once
+                    print(f"[WARNING] Local SentenceTransformer load failed: {e}")
+                    if attempt == 0:  # Only try remote on first failure
+                        print("[INFO] Attempting fallback via Hugging Face Inference API.")
+                        fallback_model = self._create_remote_model(model_name)
+                        if fallback_model is not None:
+                            self.loaded_models[model_name] = fallback_model
+                            print(f"Using Hugging Face Inference API for model '{model_name}'.")
+                            return fallback_model
+                    raise Exception(
+                        f"Failed to load embedding model '{model_name}': {str(e)}. "
+                        "Set HUGGINGFACE_API_TOKEN environment variable to enable remote embeddings fallback."
+                    ) from e
+            
+            # Should not reach here, but just in case
+            raise Exception(f"Failed to load embedding model '{model_name}' after {max_retries} attempts")
 
     def _create_remote_model(self, model_name: str) -> Optional[RemoteSentenceTransformer]:
         """
@@ -188,17 +283,21 @@ class EmbeddingService:
         token = os.getenv("HUGGINGFACE_API_TOKEN") or os.getenv("HF_API_TOKEN")
         if not token:
             print("[ERROR] Missing Hugging Face API token. Set HUGGINGFACE_API_TOKEN to enable remote embeddings.")
+            print("[INFO] You can get a free token at https://huggingface.co/settings/tokens")
             return None
 
         try:
+            print(f"[INFO] Initializing remote embedding model '{model_name}' via Hugging Face Inference API...")
             fallback_model = RemoteSentenceTransformer(model_name, token)
             # Probe once to verify connectivity/dimensions
-            fallback_model.get_sentence_embedding_dimension()
+            dimension = fallback_model.get_sentence_embedding_dimension()
+            print(f"[INFO] Remote embedding model '{model_name}' initialized successfully (dimension: {dimension})")
             return fallback_model
         except ImportError:
             print("[ERROR] huggingface_hub package is required for remote embeddings. Install with 'pip install huggingface-hub'.")
         except Exception as err:
             print(f"[ERROR] Unable to initialize remote embedding model '{model_name}': {err}")
+            print("[INFO] Check your internet connection and API token validity.")
         return None
     
     def download_model(self, model_name: str) -> Dict:

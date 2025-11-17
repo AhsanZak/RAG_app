@@ -1829,7 +1829,25 @@ async def process_database_schema(
             raise HTTPException(status_code=400, detail="No schema content to vectorize")
 
         all_texts = [chunk["text"] for chunk in chunks]
-        embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+        try:
+            embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+        except Exception as emb_error:
+            error_msg = str(emb_error).lower()
+            if "dll" in error_msg or "1114" in error_msg or "pytorch" in error_msg:
+                detail_msg = (
+                    f"Embedding model failed to load due to PyTorch DLL issue: {str(emb_error)}. "
+                    "To fix this, you have two options:\n"
+                    "1. Set HUGGINGFACE_API_TOKEN environment variable to use remote embeddings (recommended)\n"
+                    "2. Fix the PyTorch DLL issue by installing Microsoft Visual C++ Redistributable 2015-2022"
+                )
+            elif "huggingface" in error_msg or "api token" in error_msg:
+                detail_msg = (
+                    f"Embedding generation failed: {str(emb_error)}. "
+                    "Set HUGGINGFACE_API_TOKEN environment variable to enable remote embeddings."
+                )
+            else:
+                detail_msg = f"Failed to generate embeddings: {str(emb_error)}"
+            raise HTTPException(status_code=500, detail=detail_msg)
 
         all_metadatas = []
         all_ids = []
@@ -1893,7 +1911,16 @@ async def process_database_schema(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process schema: {str(e)}")
+        error_msg = str(e).lower()
+        # Provide more helpful error messages for embedding issues
+        if "embedding" in error_msg or "dll" in error_msg or "pytorch" in error_msg:
+            detail = f"Schema processing failed during vectorization: {str(e)}"
+        else:
+            detail = f"Failed to process schema: {str(e)}"
+        print(f"[ERROR] Schema processing error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=detail)
 
 
 @app.post("/api/database/sessions")
