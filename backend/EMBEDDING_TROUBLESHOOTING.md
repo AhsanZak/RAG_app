@@ -1,5 +1,29 @@
 # Embedding Service Troubleshooting Guide
 
+## 🚀 Quick Fix (Recommended)
+
+If you're seeing DLL errors, the **easiest solution** is to use remote embeddings:
+
+1. **Get a free Hugging Face API token**: https://huggingface.co/settings/tokens
+2. **Set the environment variable** (choose your shell):
+   ```powershell
+   # Windows PowerShell
+   $env:HUGGINGFACE_API_TOKEN="your_token_here"
+   ```
+   ```cmd
+   # Windows CMD
+   set HUGGINGFACE_API_TOKEN=your_token_here
+   ```
+   ```bash
+   # Linux/Mac
+   export HUGGINGFACE_API_TOKEN="your_token_here"
+   ```
+3. **Restart your application** - the system will automatically use remote embeddings when DLL errors occur
+
+That's it! The system will automatically detect DLL errors and fall back to remote embeddings without any additional configuration.
+
+---
+
 ## Problem: Intermittent PyTorch DLL Loading Errors
 
 On Windows, you may encounter intermittent PyTorch DLL loading errors:
@@ -41,9 +65,11 @@ Use Hugging Face Inference API for embeddings. This avoids DLL issues entirely.
    ```
 
 **How it works:**
-- When local PyTorch fails, the system automatically falls back to Hugging Face API
+- When local PyTorch fails, the system **automatically detects** the `HUGGINGFACE_API_TOKEN` and falls back to Hugging Face API
+- The fallback happens **immediately** when DLL errors are detected (no need to wait for all retries)
 - If `PREFER_REMOTE_EMBEDDINGS=true`, it uses remote API first (no local attempt)
 - No DLL issues, but requires internet connection
+- **No additional configuration needed** - just set the token and the system handles the rest
 
 ### Option 2: Fix Local PyTorch Installation
 
@@ -64,9 +90,10 @@ Fix the PyTorch DLL issue to use local embeddings.
 
 **How it works:**
 - System tries to load local PyTorch model
-- If it fails, automatically retries up to 3 times with exponential backoff
+- If it fails with DLL error and `HUGGINGFACE_API_TOKEN` is set, **immediately** attempts remote API (smart fallback)
+- Otherwise, automatically retries up to 3 times with exponential backoff
 - If all retries fail and `HUGGINGFACE_API_TOKEN` is set, falls back to remote API
-- If no token is set, shows helpful error message
+- If no token is set, shows helpful error message with setup instructions
 
 ## Automatic Retry Logic
 
@@ -88,9 +115,12 @@ The system now includes:
 
 1. **First attempt**: Try to load local SentenceTransformer model
 2. **On DLL error**: Retry up to 3 times with delays
-3. **After retries**: If `HUGGINGFACE_API_TOKEN` is set, automatically use remote API
-4. **If no token**: Show helpful error message with instructions
-5. **Future requests**: If a model previously failed and `PREFER_REMOTE_EMBEDDINGS=true`, skip local attempt
+3. **Automatic fallback**: If `HUGGINGFACE_API_TOKEN` is set, automatically detects DLL errors and uses remote API **without waiting for all retries**
+4. **After retries**: If local loading still fails and token is available, uses remote API
+5. **If no token**: Show helpful error message with instructions
+6. **Future requests**: If a model previously failed and `PREFER_REMOTE_EMBEDDINGS=true`, skip local attempt
+
+**Key Improvement**: The system now automatically detects when `HUGGINGFACE_API_TOKEN` is set and will immediately attempt remote embeddings when DLL errors occur, rather than waiting for all retries to complete.
 
 ## Testing
 

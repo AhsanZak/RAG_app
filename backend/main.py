@@ -1836,14 +1836,8 @@ async def process_database_schema(
             if "dll" in error_msg or "1114" in error_msg or "pytorch" in error_msg:
                 detail_msg = (
                     f"Embedding model failed to load due to PyTorch DLL issue: {str(emb_error)}. "
-                    "To fix this, you have two options:\n"
-                    "1. Set HUGGINGFACE_API_TOKEN environment variable to use remote embeddings (recommended)\n"
-                    "2. Fix the PyTorch DLL issue by installing Microsoft Visual C++ Redistributable 2015-2022"
-                )
-            elif "huggingface" in error_msg or "api token" in error_msg:
-                detail_msg = (
-                    f"Embedding generation failed: {str(emb_error)}. "
-                    "Set HUGGINGFACE_API_TOKEN environment variable to enable remote embeddings."
+                    "This is a known Windows issue. The system will retry automatically. "
+                    "If this persists, try restarting the application or your machine."
                 )
             else:
                 detail_msg = f"Failed to generate embeddings: {str(emb_error)}"
