@@ -261,8 +261,26 @@ class EmbeddingService:
         if not texts:
             return np.array([])
         
+        # Filter out None or empty texts
+        texts = [str(t) if t is not None else "" for t in texts]
+        if not texts:
+            return np.array([])
+        
         model_name = model_name or self.default_model_name
-        model = self._load_model(model_name)
+        
+        try:
+            model = self._load_model(model_name)
+        except Exception as load_error:
+            error_msg = str(load_error).lower()
+            if "dll" in error_msg or "import" in error_msg:
+                raise Exception(
+                    f"DLL/Import error loading embedding model '{model_name}': {str(load_error)}. "
+                    "This is likely a PyTorch/SentenceTransformers issue. "
+                    "Consider: 1) Installing Microsoft Visual C++ Redistributable, "
+                    "2) Setting HUGGINGFACE_API_TOKEN for remote embeddings, or "
+                    "3) Reinstalling PyTorch."
+                ) from load_error
+            raise Exception(f"Failed to load embedding model '{model_name}': {str(load_error)}") from load_error
         
         try:
             embeddings = model.encode(
@@ -270,9 +288,27 @@ class EmbeddingService:
                 convert_to_numpy=True,
                 show_progress_bar=len(texts) > 10
             )
+            
+            # Validate embeddings
+            if embeddings is None:
+                raise Exception("Model.encode() returned None")
+            if not isinstance(embeddings, np.ndarray):
+                embeddings = np.array(embeddings)
+            if len(embeddings) == 0:
+                raise Exception("Model.encode() returned empty array")
+            if len(embeddings) != len(texts):
+                raise Exception(f"Embedding count mismatch: {len(embeddings)} != {len(texts)}")
+            
             return embeddings
         except Exception as e:
-            raise Exception(f"Failed to generate embeddings: {str(e)}")
+            error_msg = str(e).lower()
+            if "dll" in error_msg or "import" in error_msg or "load" in error_msg:
+                raise Exception(
+                    f"DLL/Import error during embedding generation: {str(e)}. "
+                    "This might be a PyTorch/SentenceTransformers issue. "
+                    "Consider using Hugging Face Inference API as fallback by setting HUGGINGFACE_API_TOKEN."
+                ) from e
+            raise Exception(f"Failed to generate embeddings: {str(e)}") from e
     
     def generate_embedding(self, text: str, model_name: Optional[str] = None) -> np.ndarray:
         """

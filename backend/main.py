@@ -44,11 +44,27 @@ def _create_enriched_schema_chunks(schema_data: dict, schema_text: str) -> List[
     """
     chunks = []
     
+    # Validate inputs
+    if not schema_data:
+        schema_data = {}
+    if not isinstance(schema_data, dict):
+        print(f"[SchemaChunks] schema_data is not a dict: {type(schema_data)}")
+        schema_data = {}
+    
     if schema_data and 'tables' in schema_data:
         tables = schema_data['tables']
         
+        # Ensure tables is a list
+        if not isinstance(tables, list):
+            print(f"[SchemaChunks] tables is not a list: {type(tables)}")
+            tables = []
+        
         # Create comprehensive table-level chunks with full context
         for table in tables:
+            # Validate table structure
+            if not isinstance(table, dict):
+                print(f"[SchemaChunks] Skipping invalid table (not a dict): {type(table)}")
+                continue
             table_name = table.get('name', '')
             
             # Build comprehensive description using actual schema structure
@@ -65,7 +81,12 @@ def _create_enriched_schema_chunks(schema_data: dict, schema_text: str) -> List[
             # Detailed column information
             if table.get('columns'):
                 description_parts.append("Table Columns:")
-                for col in table['columns']:
+                columns = table['columns']
+                if not isinstance(columns, list):
+                    columns = []
+                for col in columns:
+                    if not isinstance(col, dict):
+                        continue
                     col_name = col.get('name', '')
                     col_type = str(col.get('type', '')).lower()
                     nullable = col.get('nullable', True)
@@ -86,7 +107,12 @@ def _create_enriched_schema_chunks(schema_data: dict, schema_text: str) -> List[
             # Foreign key relationships - very important for understanding table connections
             if table.get('foreign_keys'):
                 description_parts.append("Foreign Key Relationships:")
-                for fk in table['foreign_keys']:
+                foreign_keys = table['foreign_keys']
+                if not isinstance(foreign_keys, list):
+                    foreign_keys = []
+                for fk in foreign_keys:
+                    if not isinstance(fk, dict):
+                        continue
                     fk_cols = ', '.join(fk.get('constrained_columns', []))
                     ref_table = fk.get('referred_table', '')
                     ref_cols = ', '.join(fk.get('referred_columns', []))
@@ -95,7 +121,12 @@ def _create_enriched_schema_chunks(schema_data: dict, schema_text: str) -> List[
             # Indexes for query optimization hints
             if table.get('indexes'):
                 description_parts.append("Indexes:")
-                for idx in table['indexes']:
+                indexes = table['indexes']
+                if not isinstance(indexes, list):
+                    indexes = []
+                for idx in indexes:
+                    if not isinstance(idx, dict):
+                        continue
                     idx_cols = ', '.join(idx.get('columns', []))
                     unique = "UNIQUE " if idx.get('unique') else ""
                     description_parts.append(f"  {unique}Index: {idx_cols}")
@@ -127,7 +158,12 @@ def _create_enriched_schema_chunks(schema_data: dict, schema_text: str) -> List[
             
             # Create individual column chunks with full context for better granularity
             if table.get('columns'):
-                for col in table['columns']:
+                columns = table['columns']
+                if not isinstance(columns, list):
+                    columns = []
+                for col in columns:
+                    if not isinstance(col, dict):
+                        continue
                     col_name = col.get('name', '')
                     col_type = str(col.get('type', '')).lower()
                     
@@ -165,7 +201,12 @@ Data Type: {col_type}
             
             # Create relationship chunks to help understand table connections
             if table.get('foreign_keys'):
-                for fk in table['foreign_keys']:
+                foreign_keys = table['foreign_keys']
+                if not isinstance(foreign_keys, list):
+                    foreign_keys = []
+                for fk in foreign_keys:
+                    if not isinstance(fk, dict):
+                        continue
                     fk_cols = ', '.join(fk.get('constrained_columns', []))
                     ref_table = fk.get('referred_table', '')
                     ref_cols = ', '.join(fk.get('referred_columns', []))
@@ -309,83 +350,188 @@ def _vectorize_schema_for_session(
     embedding_model_name: Optional[str] = None
 ) -> bool:
     """Ensure a session has an up-to-date vector store for its schema."""
-    if not schema_record or not schema_record.schema_data:
-        return False
-
-    schema_data = copy.deepcopy(schema_record.schema_data or {})
-    schema_text = schema_record.schema_text or ""
-
-    if embedding_model_name and not get_embedding_model_info(embedding_model_name):
-        embedding_model_name = None
-    if not embedding_model_name:
-        # Try to read embedding model from schema metadata, fall back to default
-        meta_block = None
-        if isinstance(schema_data, dict):
-            meta_block = schema_data.get("_meta") or schema_data.get("meta")
-        if isinstance(meta_block, dict):
-            embedding_model_name = meta_block.get("embedding_model")
-    if embedding_model_name and not get_embedding_model_info(embedding_model_name):
-        embedding_model_name = None
-    if not embedding_model_name:
-        embedding_model_name = get_default_embedding_model()
-
-    collection_name = f"db_session_{session.id}"
     try:
-        existing_collections = chromadb_service.list_collections()
-    except Exception:
-        existing_collections = []
+        if not schema_record:
+            print("[SchemaVectors] No schema record provided")
+            return False
+        
+        # Validate and normalize schema_data
+        if not schema_record.schema_data:
+            print("[SchemaVectors] No schema_data in schema_record")
+            return False
 
-    try:
-        if collection_name in existing_collections:
-            chromadb_service.delete_collection(collection_name)
-    except Exception as cleanup_error:
-        print(f"[SchemaVectors] Unable to clear existing collection '{collection_name}': {cleanup_error}")
+        # Safely copy schema_data
+        try:
+            schema_data = copy.deepcopy(schema_record.schema_data)
+        except Exception as copy_error:
+            print(f"[SchemaVectors] Error copying schema_data: {copy_error}")
+            # Try simple copy if deepcopy fails
+            if isinstance(schema_record.schema_data, dict):
+                schema_data = dict(schema_record.schema_data)
+            elif isinstance(schema_record.schema_data, str):
+                try:
+                    import json
+                    schema_data = json.loads(schema_record.schema_data)
+                except:
+                    schema_data = {"tables": []}
+            else:
+                schema_data = {}
 
-    chunks = _create_enriched_schema_chunks(schema_data, schema_text)
-    if not chunks:
+        # Ensure schema_data is a dict
+        if not isinstance(schema_data, dict):
+            print(f"[SchemaVectors] schema_data is not a dict, type: {type(schema_data)}")
+            schema_data = {}
+
+        schema_text = schema_record.schema_text or ""
+        
+        # If schema_data is empty but we have schema_text, try to use it
+        if not schema_data.get("tables") and schema_text:
+            print("[SchemaVectors] No tables in schema_data, using schema_text fallback")
+            # Create minimal schema_data from text
+            schema_data = {
+                "database_type": schema_data.get("database_type", "unknown"),
+                "database_name": schema_data.get("database_name", "unknown"),
+                "tables": []
+            }
+
+        # Determine embedding model
+        if embedding_model_name and not get_embedding_model_info(embedding_model_name):
+            embedding_model_name = None
+        if not embedding_model_name:
+            # Try to read embedding model from schema metadata, fall back to default
+            meta_block = None
+            if isinstance(schema_data, dict):
+                meta_block = schema_data.get("_meta") or schema_data.get("meta")
+            if isinstance(meta_block, dict):
+                embedding_model_name = meta_block.get("embedding_model")
+        if embedding_model_name and not get_embedding_model_info(embedding_model_name):
+            embedding_model_name = None
+        if not embedding_model_name:
+            try:
+                embedding_model_name = get_default_embedding_model()
+            except Exception as e:
+                print(f"[SchemaVectors] Error getting default embedding model: {e}")
+                # Fallback to a known model
+                embedding_model_name = "all-MiniLM-L6-v2"
+
+        collection_name = f"db_session_{session.id}"
+        
+        # Clear existing collection
+        try:
+            existing_collections = chromadb_service.list_collections()
+            if collection_name in existing_collections:
+                chromadb_service.delete_collection(collection_name)
+        except Exception as cleanup_error:
+            print(f"[SchemaVectors] Unable to clear existing collection '{collection_name}': {cleanup_error}")
+
+        # Create schema chunks
+        try:
+            chunks = _create_enriched_schema_chunks(schema_data, schema_text)
+        except Exception as chunk_error:
+            print(f"[SchemaVectors] Error creating schema chunks: {chunk_error}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+        if not chunks:
+            print("[SchemaVectors] No chunks created from schema")
+            return False
+
+        all_texts = [chunk.get("text") for chunk in chunks if chunk.get("text")]
+        if not all_texts:
+            print("[SchemaVectors] No valid texts extracted from chunks")
+            return False
+
+        # Generate embeddings with error handling
+        try:
+            embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+            if embeddings is None or len(embeddings) == 0:
+                print("[SchemaVectors] Failed to generate embeddings (returned None or empty)")
+                return False
+            if len(embeddings) != len(all_texts):
+                print(f"[SchemaVectors] Embedding count mismatch: {len(embeddings)} != {len(all_texts)}")
+                return False
+        except Exception as embed_error:
+            error_msg = str(embed_error).lower()
+            print(f"[SchemaVectors] Error generating embeddings: {embed_error}")
+            import traceback
+            traceback.print_exc()
+            
+            # Check if it's a DLL/import error
+            if "dll" in error_msg or "import" in error_msg or "load" in error_msg:
+                print("[SchemaVectors] DLL/Import error detected. This might be a PyTorch/SentenceTransformers issue.")
+                print("[SchemaVectors] Consider using Hugging Face Inference API as fallback.")
+            return False
+
+        # Prepare metadata and IDs
+        all_metadatas = []
+        all_ids = []
+        for idx, chunk in enumerate(chunks):
+            text = chunk.get("text")
+            if not text:
+                continue
+            metadata = dict(chunk.get("metadata") or {})
+            metadata["session_id"] = str(session.id)
+            metadata["connection_id"] = str(connection.id)
+            metadata["chunk_index"] = idx
+            all_metadatas.append(metadata)
+            all_ids.append(f"schema_{connection.id}_{session.id}_{idx}")
+
+        # Ensure we have matching counts
+        if len(all_texts) != len(all_metadatas) or len(all_texts) != len(all_ids):
+            print(f"[SchemaVectors] Mismatch in arrays: texts={len(all_texts)}, metadatas={len(all_metadatas)}, ids={len(all_ids)}")
+            # Trim to match
+            min_len = min(len(all_texts), len(all_metadatas), len(all_ids))
+            all_texts = all_texts[:min_len]
+            all_metadatas = all_metadatas[:min_len]
+            all_ids = all_ids[:min_len]
+            embeddings = embeddings[:min_len]
+
+        # Add documents to ChromaDB
+        try:
+            chromadb_service.add_documents(
+                collection_name=collection_name,
+                texts=all_texts,
+                embeddings=embeddings,
+                metadatas=all_metadatas,
+                ids=all_ids
+            )
+        except Exception as chroma_error:
+            print(f"[SchemaVectors] Error adding documents to ChromaDB: {chroma_error}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+        # Update schema metadata and flags
+        try:
+            if isinstance(schema_data, dict):
+                meta_block = schema_data.setdefault("_meta", {})
+                if isinstance(meta_block, dict):
+                    meta_block["embedding_model"] = embedding_model_name
+                    meta_block["vectorized_at"] = datetime.utcnow().isoformat()
+                schema_record.schema_data = schema_data
+
+            schema_record.is_processed = 1
+            schema_record.session_id = session.id
+            schema_record.updated_at = datetime.utcnow()
+            db_session.commit()
+        except Exception as commit_error:
+            print(f"[SchemaVectors] Error committing schema record: {commit_error}")
+            db_session.rollback()
+            return False
+
+        print(f"[SchemaVectors] Successfully vectorized schema for session {session.id} with {len(all_texts)} chunks")
+        return True
+
+    except Exception as e:
+        print(f"[SchemaVectors] Unexpected error in _vectorize_schema_for_session: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            db_session.rollback()
+        except:
+            pass
         return False
-
-    all_texts = [chunk.get("text") for chunk in chunks if chunk.get("text")]
-    if not all_texts:
-        return False
-
-    embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
-
-    all_metadatas = []
-    all_ids = []
-    for idx, chunk in enumerate(chunks):
-        text = chunk.get("text")
-        if not text:
-            continue
-        metadata = dict(chunk.get("metadata") or {})
-        metadata["session_id"] = str(session.id)
-        metadata["connection_id"] = str(connection.id)
-        metadata["chunk_index"] = idx
-        all_metadatas.append(metadata)
-        all_ids.append(f"schema_{connection.id}_{session.id}_{idx}")
-
-    chromadb_service.add_documents(
-        collection_name=collection_name,
-        texts=all_texts,
-        embeddings=embeddings,
-        metadatas=all_metadatas,
-        ids=all_ids
-    )
-
-    # Update schema metadata and flags
-    if isinstance(schema_data, dict):
-        meta_block = schema_data.setdefault("_meta", {})
-        if isinstance(meta_block, dict):
-            meta_block["embedding_model"] = embedding_model_name
-            meta_block["vectorized_at"] = datetime.utcnow().isoformat()
-        schema_record.schema_data = schema_data
-
-    schema_record.is_processed = 1
-    schema_record.session_id = session.id
-    schema_record.updated_at = datetime.utcnow()
-    db_session.commit()
-
-    return True
 
 def _generate_result_analysis(
     llm_service: "LLMService",
@@ -1730,8 +1876,37 @@ async def process_database_schema(
                 detail="Schema not found. Please extract and save the schema before processing."
             )
 
-        schema_data = copy.deepcopy(base_schema.schema_data or {})
+        # Safely copy schema_data
+        try:
+            schema_data = copy.deepcopy(base_schema.schema_data or {})
+        except Exception as copy_error:
+            print(f"[SchemaProcess] Error copying schema_data: {copy_error}")
+            if isinstance(base_schema.schema_data, dict):
+                schema_data = dict(base_schema.schema_data)
+            elif isinstance(base_schema.schema_data, str):
+                try:
+                    import json
+                    schema_data = json.loads(base_schema.schema_data)
+                except:
+                    schema_data = {}
+            else:
+                schema_data = {}
+        
+        # Ensure schema_data is a dict
+        if not isinstance(schema_data, dict):
+            print(f"[SchemaProcess] schema_data is not a dict: {type(schema_data)}")
+            schema_data = {}
+        
         schema_text = base_schema.schema_text or ""
+        
+        # If schema_data is empty but we have schema_text, create minimal structure
+        if not schema_data.get("tables") and schema_text:
+            print("[SchemaProcess] No tables in schema_data, using schema_text fallback")
+            schema_data = {
+                "database_type": schema_data.get("database_type", "unknown"),
+                "database_name": schema_data.get("database_name", "unknown"),
+                "tables": []
+            }
 
         # Resolve embedding model to use
         embedding_model_name = session_data.get("embedding_model_name")
@@ -1746,7 +1921,11 @@ async def process_database_schema(
                 if stored_model and get_embedding_model_info(stored_model):
                     embedding_model_name = stored_model
             if not embedding_model_name:
-                embedding_model_name = get_default_embedding_model()
+                try:
+                    embedding_model_name = get_default_embedding_model()
+                except Exception as e:
+                    print(f"[SchemaProcess] Error getting default embedding model: {e}")
+                    embedding_model_name = "all-MiniLM-L6-v2"
 
         # Resolve LLM model ID
         llm_model_id = requested_llm_model_id
@@ -1834,16 +2013,63 @@ async def process_database_schema(
         except Exception as cleanup_error:
             print(f"[SchemaProcess] Unable to clear existing collection '{collection_name}': {cleanup_error}")
 
-        chunks = _create_enriched_schema_chunks(schema_data, schema_text)
+        # Create schema chunks with error handling
+        try:
+            chunks = _create_enriched_schema_chunks(schema_data, schema_text)
+        except Exception as chunk_error:
+            print(f"[SchemaProcess] Error creating schema chunks: {chunk_error}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to create schema chunks: {str(chunk_error)}"
+            )
+        
         if not chunks:
             raise HTTPException(status_code=400, detail="No schema content to vectorize")
 
-        all_texts = [chunk["text"] for chunk in chunks]
-        embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+        all_texts = [chunk.get("text") for chunk in chunks if chunk.get("text")]
+        if not all_texts:
+            raise HTTPException(status_code=400, detail="No valid text content extracted from schema chunks")
+
+        # Generate embeddings with comprehensive error handling
+        try:
+            embeddings = embedding_service.generate_embeddings(all_texts, model_name=embedding_model_name)
+            if embeddings is None or len(embeddings) == 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to generate embeddings. This might be due to DLL loading issues with PyTorch/SentenceTransformers. Consider using Hugging Face Inference API as fallback."
+                )
+            if len(embeddings) != len(all_texts):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Embedding count mismatch: {len(embeddings)} embeddings for {len(all_texts)} texts"
+                )
+        except HTTPException:
+            raise
+        except Exception as embed_error:
+            error_msg = str(embed_error).lower()
+            print(f"[SchemaProcess] Error generating embeddings: {embed_error}")
+            import traceback
+            traceback.print_exc()
+            
+            # Check if it's a DLL/import error
+            if "dll" in error_msg or "import" in error_msg or "load" in error_msg:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"DLL/Import error when loading embedding model: {str(embed_error)}. This is likely a PyTorch/SentenceTransformers issue. Consider: 1) Installing Microsoft Visual C++ Redistributable, 2) Using Hugging Face Inference API with HUGGINGFACE_API_TOKEN, or 3) Reinstalling PyTorch."
+                )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate embeddings: {str(embed_error)}"
+            )
 
         all_metadatas = []
         all_ids = []
         for idx, chunk in enumerate(chunks):
+            text = chunk.get("text")
+            if not text:
+                continue
             metadata = dict(chunk.get("metadata") or {})
             metadata["session_id"] = str(session.id)
             metadata["connection_id"] = str(connection_id)
@@ -1851,13 +2077,32 @@ async def process_database_schema(
             all_metadatas.append(metadata)
             all_ids.append(f"schema_{connection_id}_{session.id}_{idx}")
 
-        chromadb_service.add_documents(
-            collection_name=collection_name,
-            texts=all_texts,
-            embeddings=embeddings,
-            metadatas=all_metadatas,
-            ids=all_ids
-        )
+        # Ensure matching counts
+        if len(all_texts) != len(all_metadatas) or len(all_texts) != len(all_ids):
+            print(f"[SchemaProcess] Mismatch in arrays: texts={len(all_texts)}, metadatas={len(all_metadatas)}, ids={len(all_ids)}")
+            min_len = min(len(all_texts), len(all_metadatas), len(all_ids))
+            all_texts = all_texts[:min_len]
+            all_metadatas = all_metadatas[:min_len]
+            all_ids = all_ids[:min_len]
+            embeddings = embeddings[:min_len]
+
+        # Add documents to ChromaDB with error handling
+        try:
+            chromadb_service.add_documents(
+                collection_name=collection_name,
+                texts=all_texts,
+                embeddings=embeddings,
+                metadatas=all_metadatas,
+                ids=all_ids
+            )
+        except Exception as chroma_error:
+            print(f"[SchemaProcess] Error adding documents to ChromaDB: {chroma_error}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to add documents to vector store: {str(chroma_error)}"
+            )
 
         session_schema.is_processed = 1
         session_schema.updated_at = datetime.utcnow()
